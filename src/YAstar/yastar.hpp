@@ -17,35 +17,33 @@
 #endif
 
 
-// @brief 位运算优化的掩码类，最高支持64个掩码
+// @brief 位运算优化的掩码类
 struct Mask{
     struct MaskMap{
-        std::vector<unsigned long long int> mask;   // 行主序
+        std::vector<unsigned long long int> data;   // 行主序
         std::vector<int> shape; // [height, width, num_layers]
-        std::vector<int> stride;// [width*num_layers, num_layers, 1]
     };
 
     template<typename T>
     using TMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
-    TMatrix<unsigned long long int> mask;       // [height, width]，!=0表示障碍物
-    // MaskMap mask;                               // [height, width]，!=0表示障碍物
+    // TMatrix<unsigned long long int> mask;       // [height, width]，!=0表示障碍物
+    MaskMap mask;                               // [height, width]，!=0表示障碍物
     std::vector<std::string> layerNames;        // 存储层次的名称
     std::vector<TimePoint> layerTimes;          // 存储层次的更新时间
 
     Mask();
-    void setShape(int width, int height);        // 设置mask的形状，自动reset
+    void setShape(int width, int height, int num_layers = 1);        // 设置mask的形状，自动reset
     void reset();                                // 清空所有mask
     void reset(const std::string& maskName);     // 重置特定mask
     [[nodiscard]] size_t size() const;                          // 返回mask的尺寸
     [[nodiscard]] bool masked(int x, int y) const;              // 判断是点[x, y]是否被masked，返回为true表示被不可通行。（不进行安全检查）
-    [[nodiscard]] bool masked(int index) const;                 // 判断索引index处是否被masked，返回为true表示被不可通行。（不进行安全检查）
     [[nodiscard]] double duration(const std::string& maskName) const;  // 获取mask距离上次更新时间的时间差
 
     // 添加一个mask
     // @param maskmap 掩码地图，[height, width]
     // @param name 掩码的名称
-    // @param priority 掩码的优先级，为0表示最高优先级。默认为0
+    // @param maskValue 掩码地图中对应值为maskValue的位置会被置为障碍物
     bool pushMask(const TMatrix<u_char> &maskmap, const std::string& name = "", u_char maskValue = 0);
 
     // TODO:
@@ -117,6 +115,11 @@ public:
     // 设置历史记录地图
     // @param historyMap 历史地图，表示车辆真实走过的路径。默认会在原始地图上创建mask表示可行。
     // void setHistoryMap(TMatrix<u_char>& historyMap);
+
+    // @brief 设置掩码地图的层数，64 * numLayers层
+    // @param num_layers 掩码层数，默认64 * 1层。
+    // @note 这个操作会清空所有掩码，建议在初始化的时候就给设置好。
+    void setMaskNumLayers(int numLayers = 1);
 
     // @brief 设置掩码地图，优先级最高。
     // @param maskMap 掩码地图，默认0为不可行，其他情况视作可行。同setMap

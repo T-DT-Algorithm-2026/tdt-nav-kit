@@ -169,7 +169,7 @@ public:
     // 简单的梯形时间分配，得到比较稳定的解，建议speed大于40，acc影响没那么大，大于10就行
     [[nodiscard]] static std::vector<double> trapezoidalTimeAllocation(const std::vector<Eigen::Vector2f>& path, float maxSpeed, float maxAcc);
 protected:
-    int order = 5;// 阶数
+    int order = 6;// 阶数
     int _maxdx  = 3;// 最大导数阶数
     float dt = 0.1;// 时间间隔（秒）
     SfcSquare sfc;// 安全飞行走廊生成器

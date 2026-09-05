@@ -206,16 +206,21 @@ MinimumSnap::MatXd MinimumSnap::generateQ(const std::vector<double>& timeAllocat
     for (int k = 0; k < static_cast<int>(timeAllocated.size()); k++) {
         MatXd sub_Q = MatXd::Zero(order, order);
         if (normT){
+            // tau为t/T归一化时间。原系数为a。归一化系数为b。
+            // b = T @ a; integral (d^r p/dt^r)^2 dt
+            // = T^(1-2r) integral (d^r p/dtau^r)^2 dtau.
             // 遍历多项式的每一项
             for (int i = maxdx; i < order; i++) {
                 for (int l = i; l < order; l++) {
                     // l=i或者l=maxdx效果都一样
                     // 积分（pow（四阶导））|0到dt
-                    sub_Q(i, l) = static_cast<double>(Axx(i, maxdx) * Axx(l, maxdx)) / (i + l - 2 * maxdx + 1);
+                    sub_Q(i, l) = std::pow(timeAllocated[k], 1 - 2 * maxdx) *
+                        static_cast<double>(Axx(i, maxdx) * Axx(l, maxdx)) / (i + l - 2 * maxdx + 1);
                 }
             }
             // 距离惩罚项，依据为s（↓）=v（↓） * t（=）（另外，2，2惩罚项实测没啥区别）
-            sub_Q(1, 1) += 0.01;
+            // 原惩罚是 0.01*a_1^2，换元后为 0.01*b_1^2/T^2。
+            sub_Q(1, 1) += 0.01 / (timeAllocated[k] * timeAllocated[k]);
         } else{
             // 遍历多项式的每一项
             for (int i = maxdx; i < order; i++) {
@@ -249,7 +254,7 @@ MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocat
     // 返回一个子向量矩阵，与x矩阵乘法能得到f(x)的值 [1,order]
     auto getfx = [&](double ip, double segment_t){
         if(normT){
-            ip /= std::max(segment_t, 1e-6);
+            ip /= segment_t;
         }
         MatXd fx = MatXd::Zero(1, order);
         fx(0, 0) = 1; // 防止0的0次方
@@ -258,35 +263,15 @@ MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocat
         }
         return fx;
     };
-    // 返回一个子方阵，与x矩阵乘法能得到f(x)的0~n阶导数值 [n,order]。
-    // segment t表示对应分段的总时长，只在normT时有效（因为Q被归一化，A需要每一段对齐）
-    // scale以前段的时间为单位1。
-    auto getdnx = [&](double ip, int n, double segment_t, double scale = 1.0){
+    // 始终返回物理时间导数：d^a p/dt^a = T^-a d^a p/dtau^a。
+    auto getdnx = [&](double ip, int n, double segment_t){
         MatXd fx = MatXd::Zero(n, order);
-        if(normT){
-            // 段内使用t=1归一化，段间使用相对时间大小进行缩放，也就是这里的scale。
-            ip = ip / std::max(segment_t, 1e-6);
-            for(int a = 0; a < n; a++){
-                double ascale = pow(scale, a);
-                for (int b = a; b < order; b++) {
-                    if(ip == 0 && b - a == 0){
-                        fx(a, b) = 1;
-                    }
-                    else{
-                        fx(a, b) = Axx(b, a) * pow(ip, b - a) * ascale;
-                    }
-                }
-            }
-        } else{
-            for(int a = 0; a < n; a++){
-                for (int b = a; b < order; b++) {
-                    if(ip == 0 && b - a == 0){
-                        fx(a, b) = 1;
-                    }
-                    else{
-                        fx(a, b) = Axx(b, a) * pow(ip, b - a);
-                    }
-                }
+        const double u = normT ? ip / segment_t : ip;
+        for(int a = 0; a < n; a++){
+            const double scale = normT ? std::pow(segment_t, -a) : 1.0;
+            for(int b = a; b < order; b++){
+                // u=0 且 b=a 时，导数系数仍然是 a!，不能直接设为 1。
+                fx(a, b) = Axx(b, a) * (b == a ? 1.0 : std::pow(u, b - a)) * scale;
             }
         }
         return fx;
@@ -294,27 +279,7 @@ MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocat
     // 返回一个子向量矩阵，与x矩阵乘法能得到f(x)的n阶导数值 [1,order]
     // 保留用于未来可能的起始/终点速度约束
     [[maybe_unused]] auto getdx = [&](double ip, int n, double segment_t){
-        MatXd fx = MatXd::Zero(1, order);
-        if(normT){
-            ip /= std::max(segment_t, 1e-6);
-            for (int i = n; i < order; i++) {
-                if(ip == 0 && i - n == 0){
-                    fx(0, i) = 1;
-                }
-                else{
-                    fx(0, i) = Axx(i, n) * pow(ip, i - n);
-                }
-            }
-        }else{
-            for (int i = n; i < order; i++) {
-                if(ip == 0 && i - n == 0){
-                    fx(0, i) = 1;
-                }
-                else{
-                    fx(0, i) = Axx(i, n) * pow(ip, i - n);
-                }
-            }
-        }
+        MatXd fx = getdnx(ip, n + 1, segment_t).row(n);
         return fx;
     };
 
@@ -331,8 +296,8 @@ MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocat
     A.block(atline++, (numSegment - 1)*order, 1, order) = getdx(timeAllocated.back(), 1, timeAllocated.back());
     // 安全飞行走廊的交集连续性方程
     for(int i = 0; i < numSegment - 1; i++){
-        A.block(atline, i * order, order-1, order) = getdnx(timeAllocated[i], order-1, timeAllocated[i], 1.f);
-        A.block(atline, (i + 1) * order, order-1, order) = -getdnx(0, order-1, timeAllocated[i + 1], timeAllocated[i + 1] / timeAllocated[i]);
+        A.block(atline, i * order, order-1, order) = getdnx(timeAllocated[i], order-1, timeAllocated[i]);
+        A.block(atline, (i + 1) * order, order-1, order) = -getdnx(0, order-1, timeAllocated[i + 1]);
         // 归一化避免A矩阵病态
         for(int j = 0; j < order-1; j++){
             // eigen应当避免使用auto
@@ -463,9 +428,9 @@ std::vector<Eigen::Vector2f> MinimumSnap::lineDecoder(const std::vector<double>&
             auto y = solutiony(index, solutiony.cols() - 1);
             for (int j = 1; j < solutionx.cols(); j++){
                 int at = static_cast<int>(solutionx.cols()) - 1 - j;
-                double scale = std::max(pow(timeAllocated[index], j), 1e-6);
-                x += solutionx(index, at) * pow(timeAllocated[index] - reduceTime, j) / scale;
-                y += solutiony(index, at) * pow(timeAllocated[index] - reduceTime, j) / scale;
+                double tau = (timeAllocated[index] - reduceTime) / timeAllocated[index];
+                x += solutionx(index, at) * pow(tau, j);
+                y += solutiony(index, at) * pow(tau, j);
             }
             // 路径分10段即可达标，无需使用bresenham算法
             reduceTime -= timeAllocated[index] / 10.f;
@@ -475,8 +440,8 @@ std::vector<Eigen::Vector2f> MinimumSnap::lineDecoder(const std::vector<double>&
         auto y = solutiony(index, solutiony.cols() - 1);
         for (int j = 1; j < solutionx.cols(); j++){
             int at = static_cast<int>(solutionx.cols()) - 1 - j;
-            x += solutionx(index, at) * pow(timeAllocated[index], j);
-            y += solutiony(index, at) * pow(timeAllocated[index], j);
+            x += solutionx(index, at);
+            y += solutiony(index, at);
         }
         op.emplace_back(x, y);
     }else{
@@ -729,6 +694,12 @@ std::pair<MinimumSnap::MatXd, MinimumSnap::MatXd> MinimumSnap::osqpExecute(
     VecXd c = VecXd::Zero(static_cast<int>(order * timeAllocated.size()));
 
     auto xyinit = initXY(timeAllocated, path); // timesize = corridor.size() = path.size() - 1
+    if(normT){
+        for(int i = 0; i < static_cast<int>(timeAllocated.size()); ++i){
+            xyinit.first(i * order + 1) = path[i + 1].x() - path[i].x();
+            xyinit.second(i * order + 1) = path[i + 1].y() - path[i].y();
+        }
+    }
 
     // x方向
     auto low = generateLow(uarea.first, initVxMin);

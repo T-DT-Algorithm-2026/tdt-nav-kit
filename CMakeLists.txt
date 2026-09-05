@@ -5,8 +5,8 @@ project(play)
 # set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # # #使用release o2
-# set(CMAKE_BUILD_TYPE "Release")
-# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall")
+set(CMAKE_BUILD_TYPE "Release")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -Wall")
 
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)

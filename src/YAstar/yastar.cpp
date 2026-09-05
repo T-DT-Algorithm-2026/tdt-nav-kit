@@ -10,13 +10,14 @@
 ////////////////////////////// Mask ///////////////////////////////
 
 Mask::Mask(){
-    mask = TMatrix<unsigned long long int>(1, 1);
+    mask = Mask::MaskMap();
     layerNames.clear();
     layerTimes.clear();
 }
 
-void Mask::setShape(int width, int height){
-    mask = TMatrix<unsigned long long int>(height, width);
+void Mask::setShape(int width, int height, int num_layers){
+    mask.shape = {height, width, num_layers};
+    mask.data.resize(height * width * num_layers, 0);
     reset();
     for(auto& t: layerTimes){
         t = std::chrono::steady_clock::now();
@@ -25,7 +26,7 @@ void Mask::setShape(int width, int height){
 
 void Mask::reset(){
     // 设置mask为全0
-    mask.setConstant(0);
+    std::fill(mask.data.begin(), mask.data.end(), 0);
     layerNames.clear();
     layerTimes.clear();
 }
@@ -42,13 +43,13 @@ void Mask::reset(const std::string& maskName){
         // not found, escape
         return;
     }
+    int layerId = targetLayer / 64;
+    int bitId = targetLayer % 64;
+    unsigned long long int bitChooser = ~(static_cast<unsigned long long int>(1) << bitId); // 对应层的掩码，并翻转
+    for(int offset = layerId; offset < mask.data.size(); offset += mask.shape[2]){
+        mask.data[offset] &= bitChooser;
+    }
     layerTimes[targetLayer] = std::chrono::steady_clock::now();
-    unsigned long long int layerChooser = static_cast<unsigned long long int>(1) << targetLayer; // 对应层的掩码，并翻转
-    layerChooser = ~layerChooser;
-
-    mask = mask.unaryExpr([&layerChooser](const unsigned long long int& origin) {
-        return origin & layerChooser;
-    });
 }
 
 size_t Mask::size()const{
@@ -56,17 +57,18 @@ size_t Mask::size()const{
 }
 
 bool Mask::masked(int x, int y) const{
-    return mask(y, x) != 0;
-}
-
-bool Mask::masked(int index) const{
-    return mask.data()[index] != 0;
+    int base = (y * mask.shape[1] + x) * mask.shape[2];
+    bool op = false;
+    for(int a = 0; a < mask.shape[2]; a++){
+        op |= (mask.data[base + a]);
+    }
+    return op;
 }
 
 bool Mask::pushMask(const TMatrix<u_char>& maskMap,  const std::string& name, u_char maskValue){
-    if(mask.rows() != maskMap.rows() || mask.cols() != maskMap.cols()){
+    if(mask.shape[0] != maskMap.rows() || mask.shape[1] != maskMap.cols()){
         std::cout << "\033[33mmask map shape error: shape["  << maskMap.rows() << ", " << maskMap.cols() <<
-            "] should match map shape:[" << mask.rows() << ", " << mask.cols() << "] skipped\033[0m" << std::endl;
+            "] should match map shape:[" << mask.shape[0] << ", " << mask.shape[1] << "] skipped\033[0m" << std::endl;
         return false;
     }
     int curlayer = -1;
@@ -78,27 +80,29 @@ bool Mask::pushMask(const TMatrix<u_char>& maskMap,  const std::string& name, u_
     }
     if(curlayer == -1){ 
         // create new layer, already allocated
-        if (size() >= sizeof(unsigned long long int) * 8) {
-            std::cout << "错误：当前仅支持到64个以内的掩码！跳过" << std::endl;
+        int laSize = sizeof(unsigned long long int) * 8 * mask.shape[2];
+        if (size() >= laSize) {
+            std::cout << "警告：当前仅支持" << laSize << "个以内的掩码，请预分配更多的层数！跳过" << std::endl;
             return false; // 不支持多于64个mask
         }
         curlayer = static_cast<int>(size());
         layerNames.push_back(name);
         layerTimes.push_back(std::chrono::steady_clock::now());
     }
-    layerTimes[curlayer] = std::chrono::steady_clock::now();
-    unsigned long long int layerChooser = static_cast<unsigned long long int>(1) << curlayer; // 对应层的掩码
-    std::transform(mask.data(), mask.data() + mask.size(), maskMap.data(), mask.data(), [&layerChooser, &maskValue](unsigned long long int &origin, const u_char &ip){
-        // op为1表示占用，为0表示空闲！ ip仅为value时才表示占用！
-        unsigned long long int op;
-        if(ip == maskValue){
-            op = origin | layerChooser;
+    int layerId = curlayer / 64;
+    int bitId = curlayer % 64;
+    unsigned long long int bitChooser = static_cast<unsigned long long int>(1) << bitId; // 对应层的掩码
+    for(int source = 0; source < maskMap.size(); source++){
+        auto& src = maskMap.data()[source];
+        auto& tgt = mask.data[source * mask.shape[2] + layerId];
+        if(src == maskValue){
+            tgt |= bitChooser;
         }
         else{
-            op = origin & (~layerChooser);
+            tgt &= ~bitChooser;
         }
-        return op;
-     });
+    }
+    layerTimes[curlayer] = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -417,6 +421,10 @@ void YAstar::setMap(int width, int height, float mapping, float originx, float o
     reset();
 }
 
+void YAstar::setMaskNumLayers(int numLayers){
+    mask.setShape(occMap.cols(), occMap.rows(), numLayers);
+}
+
 void YAstar::setMaskMap(const YAstar::TMatrix<u_char>& maskMap, const std::string& name, u_char maskValue){
     if(maskMap.rows() != occMap.rows() || maskMap.cols() != occMap.cols()){
         std::cout << "\033[33mmask map shape error: shape["  << maskMap.rows() << ", " << maskMap.cols() <<
@@ -519,7 +527,8 @@ YAstar::TMatrix<u_char> YAstar::getCostMapImage(){
     for(int i = 0; i < costMap.rows(); i++){
         for(int j = 0; j < costMap.cols(); j++){
             float scale = costMap(i, j);
-            scale = std::clamp(scale, 0.f, 255.f);
+            // scale = std::clamp(scale, 0.f, 255.f);
+            scale = std::min(std::max(scale, 0.f), 255.f);
             costMapImage(i, j) = static_cast<u_char>(scale);
         }
     }
@@ -912,7 +921,7 @@ Eigen::Vector2f YAstar::findSavePoint(float xf, float yf, float maxRadius){
 
 bool YAstar::isInObstacle(int x, int y){
     // 优先级从高到低进行return
-    if (mask.masked(y * static_cast<int>(occMap.cols()) + x) ||
+    if (mask.masked(x, y) ||
         occMap(y, x) > occThs){
         return true;
     }
