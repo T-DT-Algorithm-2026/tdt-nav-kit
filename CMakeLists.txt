@@ -19,6 +19,7 @@ include_directories(
 add_executable(play
     main.cpp
     ./src/YAstar/yastar.cpp
+    ./src/YAstar/kinodynamicAstar.cpp
     ./src/MinimumSnapOsqp/minimumSnap.cpp
     ./src/MinimumSnapOsqp/sfcSquare.cpp
 )

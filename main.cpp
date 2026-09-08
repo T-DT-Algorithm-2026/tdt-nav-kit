@@ -1,6 +1,7 @@
 #include <sys/types.h>
 #include <Eigen/Dense>
 #include "./src/YAstar/yastar.hpp"
+#include "./src/YAstar/kinodynamicAstar.hpp"
 #include "./src/MinimumSnapOsqp/minimumSnap.hpp"
 #include "./src/MinimumSnapOsqp/sfcSquare.hpp"
 #include <chrono>
@@ -105,7 +106,7 @@ double test(Eigen::Vector2f start, Eigen::Vector2f end){
     // 设置代价场参数
     benchTimeVoid("set cost map", [&](){
         // astar.setCostField(1.f, [](float x){ return 1.0f;});// jps级别
-        astar.setCostField(1.f, [](float x){ return 1.0f / (0.1f + x); });
+        astar.setCostField(1.f, [](float x){ return 0.5f / (0.1f + x); });
         astar.initCostMap(); // sparse模式，使用快速SDF算法
     });
     
@@ -154,8 +155,8 @@ double test(Eigen::Vector2f start, Eigen::Vector2f end){
     // static int debugIter = 1;
     // input.setCollisionCheckIter(debugIter++); // 碰撞检测迭代次数
     input.setCollisionCheckIter(6); // 碰撞检测迭代次数
-    input.setMaxSpeed(8.f); // 最大速度
-    input.setMaxAcc(2.f);   // 这两个调差不多就行，实际上影响不大
+    input.setMaxSpeed(3.f); // 最大速度
+    input.setMaxAcc(1.f);   // 这两个调差不多就行，实际上影响不大
     input.setMaxCorridorRange(2.5f);    // sfc最大膨胀范围
     input.setCorridorShrink(0.0f);      // sfc缩小距离，设置为0也会在迭代中自行缩小的。
     input.setNormTime(true);            // 理论上可以降低矩阵的病态程度，但是speed跟acc设置的差不多的话，其实不需要开。而且是实验性功能，轨迹质量不算很好。
@@ -388,7 +389,71 @@ bool testSpeed(){
 
 #include <random>
 
+bool testKastar(){
+    cv::Mat map = cv::imread("../images/rmuc2025.png", cv::IMREAD_GRAYSCALE);
+    if(map.empty()){
+        std::cout<<"testKastar: 地图读取失败"<<std::endl;
+        return false;
+    }
+    KinodynamicAstar astar(map.cols, map.rows, 0.05f, 0.f, 0.f);
+    astar.setMap(map.cols, map.rows, map.data);
+    astar.config.maxNodes = 150000; // 跨越整张地图，增加搜索容量
+    astar.config.sampleTime = 0.01;
+    Eigen::Vector2d start(25.2695, 14.14615), end(1.47266, 9.1749);
+    // 世界坐标Y轴向上，图像Y轴向下；速度也采用图像坐标方向。
+    start.y() = (map.rows - 1)*0.05 - start.y();
+    end.y() = (map.rows - 1)*0.05 - end.y();
+    Eigen::Vector2d velocity(0, 0), acceleration(0, 0);
+    auto result = benchTime("kinodynamic astar search", [&](){
+        return astar.search(start, velocity, acceleration, end);
+    });
+    std::vector<Eigen::Vector2f> path;
+    double maxVel = 0, maxAcc = 0;
+    size_t collisions = 0;
+    for(const auto& sample : result.trajectory){
+        path.push_back(sample.state.head<2>().cast<float>());
+        maxVel = std::max(maxVel, sample.state.tail<2>().cwiseAbs().maxCoeff());
+        maxAcc = std::max(maxAcc, sample.acceleration.cwiseAbs().maxCoeff());
+        if(path.size() > 1 && astar.lineInObsticle(path[path.size() - 2], path.back())){
+            collisions++;
+        }
+    }
+    double error = result.success ? (result.trajectory.back().state.head<2>() - end).norm() :
+        std::numeric_limits<double>::infinity();
+    bool passed = result.success && error < 1e-6 && collisions == 0 &&
+        maxVel <= astar.config.maxVel + 1e-6 && maxAcc <= astar.config.maxAcc + 1e-6 &&
+        result.trajectory.back().state.tail<2>().norm() < 1e-6;
+    std::cout<<"testKastar: success="<<result.success<<" nodes="<<result.nodes
+        <<" iter="<<result.iterations<<" length="<<(path.empty() ? 0.f : YAstar::getLength(path))
+        <<" duration="<<(result.trajectory.empty() ? 0. : result.trajectory.back().time)
+        <<" 位置误差="<<error<<" 各轴最大速度="<<maxVel<<" 各轴最大加速度="<<maxAcc
+        <<" 碰撞线段="<<collisions<<" 检查="<<(passed ? "通过" : "失败")<<std::endl;
+    cv::Mat image;
+    cv::cvtColor(map, image, cv::COLOR_GRAY2BGR);
+    std::vector<cv::Point> curve;
+    for(const auto& point : path){
+        curve.emplace_back(point.x() / 0.05, point.y() / 0.05);
+    }
+    if(!curve.empty()){
+        cv::polylines(image, curve, false, cv::Scalar(0, 0, 192), 1, cv::LINE_AA);
+    }
+    for(size_t i = 0; i < result.trajectory.size(); i += 100){
+        const auto& state = result.trajectory[i].state;
+        if(state.tail<2>().norm() < 1e-6) continue;
+        Eigen::Vector2d tip = state.head<2>() + state.tail<2>().normalized()*0.5;
+        cv::arrowedLine(image, cv::Point(state.x()/0.05, state.y()/0.05),
+            cv::Point(tip.x()/0.05, tip.y()/0.05), cv::Scalar(0, 160, 160), 1, cv::LINE_AA, 0, 0.35);
+    }
+    cv::circle(image, cv::Point(start.x()/0.05, start.y()/0.05), 3, cv::Scalar(0, 160, 0), -1);
+    cv::circle(image, cv::Point(end.x()/0.05, end.y()/0.05), 3, cv::Scalar(255, 0, 0), -1);
+    cv::resize(image, image, cv::Size(image.cols * 3, image.rows * 3));
+    cv::imshow("path", image);
+    cv::waitKey(0);
+    return true;
+}
+
 int main(){
+    testKastar();
     testSpeed();
     test({25.2695, 14.14615}, {1.47266, 9.1749});
     test({2.5323, 1.88688}, {25.5733, 13.5454});

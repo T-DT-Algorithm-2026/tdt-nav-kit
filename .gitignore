@@ -1,5 +1,9 @@
 .cache
 .vscode
+.ref
 
 build
-tests/norm_time.cpp
+tests/*
+3rd/*
+
+!3rd/.gitkeep
