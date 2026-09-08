@@ -2,6 +2,7 @@
 #include <Eigen/src/Core/Matrix.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <numeric>
@@ -41,6 +42,133 @@ minimum snap的目的是找到一个函数fx经过起始点、途经点与终点
     trapezoidalTimeAllocation可能有问题，分配的时间与path的size相同感觉不太对。
 */
 
+using Item = MinimumSnap::SolveInput::Item;
+using MatXd = MinimumSnap::MatXd;
+using PointPair = MinimumSnap::PointPair;
+
+// 将求解变量中的升幂系数转换为lineDecoder使用的降幂排列。
+static std::pair<MatXd, MatXd> unpack(const MatXd& solution, int order_){
+    MatXd x(solution.rows() / order_, order_);
+    MatXd y(solution.rows() / order_, order_);
+    for(int i = 0; i < x.rows(); i++){
+        for(int j = 0; j < order_; j++){
+            x(i, order_ - 1 - j) = solution(i * order_ + j, 0);
+            y(i, order_ - 1 - j) = solution(i * order_ + j, 1);
+        }
+    }
+    return {x, y};
+}
+
+static bool validTimes(const std::vector<double>& times, size_t pointNum, int order_, int maxdx){
+    if(pointNum < 2 || times.size() + 1 != pointNum || order_ < 3 || maxdx < 2){
+        return false;
+    }
+    return std::all_of(times.begin(), times.end(), [](double time){
+        return std::isfinite(time) && time > 0.;
+    });
+}
+
+// 在碰撞分段中插入中间控制点，并同步拆分对应时间。
+static std::vector<int> insertMidpoints(
+    std::vector<double>& times,
+    std::vector<Item>& points,
+    const std::vector<int>& bad
+){
+    if(times.size() + 1 != points.size()){
+        return {};
+    }
+
+    std::vector<int> inserted;
+    for(auto it = bad.rbegin(); it != bad.rend(); ++it){
+        int i = *it;
+        if(i < 0 || static_cast<size_t>(i) >= times.size() ||
+           static_cast<size_t>(i) + 1 >= points.size()){
+            continue;
+        }
+        Item point;
+        point.xy = (points[i].xy + points[i + 1].xy) * 0.5f;
+        point.autoCorridor = false;
+        point.corridor = {point.xy.x(), point.xy.y(), point.xy.x(), point.xy.y()};
+        points.insert(points.begin() + i + 1, point);
+        for(auto& index : inserted){
+            if(index >= i + 1){
+                index++;
+            }
+        }
+        inserted.push_back(i + 1);
+
+        double half = times[i] * 0.5;
+        times[i] = half;
+        times.insert(times.begin() + i + 1, half);
+    }
+    std::sort(inserted.begin(), inserted.end());
+    return inserted;
+}
+
+// 两个后端共用碰撞迭代。插入中间点时保留已有Item中的速度约束。
+template<typename Solve, typename Sample, typename Collision, typename Update>
+static MinimumSnap::SolveOutput iterate(
+    const std::vector<double>& times,
+    const std::vector<Item>& items,
+    int maxIter,
+    double timeLimit,
+    Solve solve,
+    Sample sample,
+    Collision collision,
+    Update update
+){
+    MinimumSnap::SolveOutput result;
+    auto ta = times;
+    auto points = items;
+    auto begin = std::chrono::steady_clock::now();
+
+    for(int round = 0; round < maxIter; round++){
+        auto coefficients = solve(ta, points);
+        if(coefficients.first.rows() != static_cast<int>(ta.size()) ||
+           coefficients.second.rows() != static_cast<int>(ta.size()) ||
+           coefficients.first.cols() != coefficients.second.cols() ||
+           coefficients.first.cols() == 0){
+            result.success = false;
+            break;
+        }
+
+        result.path.clear();
+        std::vector<int> bad;
+        for(int i = 0; i < coefficients.first.rows(); i++){
+            auto curve = sample(ta, i, coefficients.first, coefficients.second);
+            if(curve.size() < 2 || !std::all_of(curve.begin(), curve.end(),
+                [](const Eigen::Vector2f& point){return point.allFinite();})){
+                result.path.clear();
+                result.success = false;
+                result.iter = round + 1;
+                result.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+                return result;
+            }
+            bool hit = false;
+            for(size_t j = 1; j < curve.size(); j++){
+                hit = hit || collision(curve[j - 1], curve[j]);
+            }
+            if(hit){
+                bad.push_back(i);
+            }
+            result.path.insert(result.path.end(), curve.begin(),
+                i + 1 == coefficients.first.rows() ? curve.end() : curve.end() - 1);
+        }
+
+        result.iter = round + 1;
+        result.success = bad.empty() && !result.path.empty();
+        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        if(result.success || round + 1 == maxIter || elapsed >= timeLimit){
+            break;
+        }
+
+        update(ta, points, bad, round);
+    }
+
+    result.time = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    return result;
+}
+
 MinimumSnap::Backend MinimumSnap::SolveInput::autoBackend(){
     // 现在的backend不挑条件，直接返回osqpcorridor。等sfc整好了再换。
     return Backend::OSQPCorridor;
@@ -58,6 +186,10 @@ void MinimumSnap::setDt(float _dt){
 
 void MinimumSnap::setTL(double _tl){
     this->timeLimit = _tl;
+}
+
+void MinimumSnap::setStrictCollision(bool strict){
+    this->strictCollision = strict;
 }
 
 void MinimumSnap::setMaxDx(int _maxdx){
@@ -83,94 +215,78 @@ SfcSquare& MinimumSnap::getSfc(){
 }
 
 MinimumSnap::SolveOutput MinimumSnap::solve(SolveInput &input){
-    auto backend = input.getBackend();
-    if (backend == MinimumSnap::Backend::Invalid){
-        backend = input.autoBackend();
-        input.setBackend(backend);
-        backend = input.getBackend();
-    }
-    // 获取初始速度参数
-    bool useCorridor = backend == MinimumSnap::Backend::OSQPCorridor;
-    bool normT = input.getNormTime();
-    float initVxMax = std::numeric_limits<float>::max();
-    float initVyMax = std::numeric_limits<float>::max();
-    float initVxMin = -std::numeric_limits<float>::max();
-    float initVyMin = -std::numeric_limits<float>::max();
-    float maxSpeed = input.getMaxSpeed();
-    float maxAcc = input.getMaxAcc();
-    float maxCorridorRange = input.getMaxCorridorRange();
-    float corridorShrink = input.getCorridorShrink();
-    auto timeAllocated = input.getTimeAllocated();
-    auto path = input.getPath();
-    int iter = input.getIterNum();
-    std::vector<std::array<float, 4>> corridor;
-
-    if(!input.havePath()){
-        std::cerr << "\033[31mInvalid input: 没有路径信息\033[0m" << std::endl;
+    const auto& items = input.getItems();
+    if(!input.havePath() || items.empty()){
         return {};
     }
-    if(path.empty()){
-        return {};
-    }
-    if(path.size() == 1){
-        MinimumSnap::SolveOutput result;
-        result.path = path;
-        result.corridor.clear();
-        result.iter = 0;
-        result.time = 0.;
-        result.success = true;
-        return result;
-    }
-    if(!input.haveTimeAllocated()){
-        timeAllocated = trapezoidalTimeAllocation(path, maxSpeed, maxAcc);    
-    }
-    if(input.haveInitVelocity()){
-        initVxMax = input.getInitVelocityX();
-        initVyMax = input.getInitVelocityY();
-        initVxMin = input.getInitVelocityX();
-        initVyMin = input.getInitVelocityY();
-    }
-    if (!useCorridor){
-        maxCorridorRange = 0.f;
-    }
-
-    switch (backend) {
-        case MinimumSnap::Backend::OSQPCorridor:
-        case MinimumSnap::Backend::OSQPPath: { 
-            return _solve(
-                timeAllocated,
-                path,
-                maxCorridorRange,
-                corridorShrink,
-                iter,
-                initVxMax,
-                initVyMax,
-                initVxMin,
-                initVyMin,
-                normT
-            );
-        } break;
-        case MinimumSnap::Backend::Close: {
-            return _solve(
-                timeAllocated,
-                path,
-                iter,
-                initVxMax,
-                initVyMax,
-                initVxMin,
-                initVyMin,
-                normT
-            );
-        }
-        case MinimumSnap::Backend::Invalid:
-        default: {
-            std::cerr << "\033[31mInvalid backend\033[0m" << std::endl;
+    for(const auto& item : items){
+        if(!item.xy.allFinite() || (item.useVxvy && !item.vxvy.allFinite())){
             return {};
         }
+        if(!item.autoCorridor){
+            const auto& box = item.corridor;
+            if(!std::all_of(box.begin(), box.end(), [](float value){return std::isfinite(value);}) ||
+               box[0] > item.xy.x() || box[2] < item.xy.x() ||
+               box[1] > item.xy.y() || box[3] < item.xy.y()){
+                std::cout << "控制点不在手动走廊内" << std::endl;
+                return {};
+            }
+        }
     }
+
+    if(items.size() == 1){
+        SolveOutput result;
+        result.path = input.getPath();
+        // 单控制点没有可构造的分段，非零速度约束无法在此输入下满足。
+        result.success = !items.front().useVxvy || items.front().vxvy.isZero();
+        return result;
+    }
+
+    auto timeAllocated = input.getTimeAllocated();
+    if(!input.haveTimeAllocated()){
+        if(input.getMaxSpeed() <= 0 || input.getMaxAcc() <= 0){
+            return {};
+        }
+        timeAllocated = trapezoidalTimeAllocation(input.getPath(), input.getMaxSpeed(), input.getMaxAcc());
+    }
+    if(!validTimes(timeAllocated, items.size(), order, _maxdx)){
+        std::cout << "时间分配或多项式阶数无效" << std::endl;
+        return {};
+    }
+
+    auto backend = input.getBackend();
+    if(backend == Backend::Invalid){
+        backend = input.autoBackend();
+        input.setBackend(backend);
+    }
+    if(backend == Backend::Close){
+        // 闭式求解只能处理等式，范围走廊需要使用OSQPCorridor后端。
+        for(const auto& item : items){
+            if(!item.autoCorridor &&
+               (item.corridor[0] != item.corridor[2] || item.corridor[1] != item.corridor[3])){
+                std::cout << "手动走廊范围需要使用OSQPCorridor后端" << std::endl;
+                return {};
+            }
+        }
+        return _solve(timeAllocated, items, input.getIterNum(), input.getNormTime());
+    }
+    if(backend == Backend::OSQPPath || backend == Backend::OSQPCorridor){
+        float range = backend == Backend::OSQPPath ? 0.f : input.getMaxCorridorRange();
+        return _solve(timeAllocated, items, range, input.getCorridorShrink(),
+            input.getIterNum(), input.getNormTime());
+    }
+    return {};
 }
 
 std::vector<double> MinimumSnap::trapezoidalTimeAllocation(const std::vector<Eigen::Vector2f>& path, float maxSpeed, float maxAcc){
+    if(path.size() < 2 || !std::isfinite(maxSpeed) || !std::isfinite(maxAcc) ||
+       maxSpeed <= 0.f || maxAcc <= 0.f ||
+       !std::all_of(path.begin(), path.end(), [](const Eigen::Vector2f& point){
+           return point.allFinite();
+       })){
+        return {};
+    }
+
     std::vector<double> timeAllocated(path.size()-1);
     // 按小段分配梯形时间，这样也可以起到转弯减速的作用。
     float distThs = 0.5f * maxSpeed * maxSpeed / maxAcc;
@@ -241,16 +357,18 @@ MinimumSnap::MatXd MinimumSnap::generateQ(const std::vector<double>& timeAllocat
 }
 
 MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocated, bool normT) const{
-    auto numSegment = static_cast<int>(timeAllocated.size());// 分段数量
-    auto aq = order * numSegment;// A矩阵的列数
-    // int maxdx = std::min(_maxdx, order-1);
+    const int numSegment = static_cast<int>(timeAllocated.size());// 分段数量
+    const int aq = order * numSegment;// A矩阵的列数
+    const int continuity = std::min(_maxdx, order-1);
 
-    int numConstrains = 1                               // 1个起点速度约束
-                        + 1                             // 1个起点位置约束
-                        + numSegment                    // 1~end 个t=t0时刻点的位置约束
-                        + 1                             // 1个终点速度约束(速度为0)
-                        + (numSegment - 1) * (order-1); // numSegment - 1个连续性约束
-    MatXd A = MatXd::Zero(numConstrains, aq);
+    const int numConstraints =
+        1                              // 1个起点速度约束
+        + 1                            // 1个起点位置约束
+        + numSegment                   // 1~end个控制点位置约束
+        + 1                            // 1个终点速度约束
+        + (numSegment - 1) * continuity // numSegment - 1个连续性约束
+        + (numSegment - 1);            // numSegment - 1个途经点速度约束
+    MatXd A = MatXd::Zero(numConstraints, aq);
     // 返回一个子向量矩阵，与x矩阵乘法能得到f(x)的值 [1,order]
     auto getfx = [&](double ip, double segment_t){
         if(normT){
@@ -296,15 +414,22 @@ MinimumSnap::MatXd MinimumSnap::generateA(const std::vector<double>& timeAllocat
     A.block(atline++, (numSegment - 1)*order, 1, order) = getdx(timeAllocated.back(), 1, timeAllocated.back());
     // 安全飞行走廊的交集连续性方程
     for(int i = 0; i < numSegment - 1; i++){
-        A.block(atline, i * order, order-1, order) = getdnx(timeAllocated[i], order-1, timeAllocated[i]);
-        A.block(atline, (i + 1) * order, order-1, order) = -getdnx(0, order-1, timeAllocated[i + 1]);
+        A.block(atline, i * order, continuity, order) = getdnx(timeAllocated[i], continuity, timeAllocated[i]);
+        A.block(atline, (i + 1) * order, continuity, order) = -getdnx(0, continuity, timeAllocated[i + 1]);
         // 归一化避免A矩阵病态
-        for(int j = 0; j < order-1; j++){
+        for(int j = 0; j < continuity; j++){
             // eigen应当避免使用auto
             double norm = A.row(atline + j).norm();
             A.row(atline + j) /= norm;
         }
-        atline += order-1;
+        atline += continuity;
+    }
+    // 途经点速度约束行，未启用时由上下界设置为无约束。
+    // 途经点速度使用后一段的起始导数，连续性方程会保证两侧导数一致。
+    for(int i = 1; i < numSegment; i++){
+        // 归一化时间下，升幂多项式的一阶系数需要换算为物理速度。
+        A(atline, i * order + 1) = normT ? 1. / timeAllocated[i] : 1.;
+        atline++;
     }
     return A;
 }
@@ -313,26 +438,34 @@ MinimumSnap::VecXd MinimumSnap::generateLow(const std::vector<Eigen::Vector2f>& 
     // 按顺序：
     // 0：起点速度约束
     // 1：起点位置约束
-    // 2~numSegment+1：每个segment的中间点约束
-    // numSegment+2：终点速度约束（为0）
+    // 2~numSegment+1：每个控制点的位置约束
+    // numSegment+2：终点速度约束（默认不限制）
     // 其余：连续性约束（等于0）
-    int numSegment = static_cast<int>(restrictArea.size()) - 1; // 分段数量
-    VecXd low = VecXd::Zero(1       // 1个起点速度约束
-        + 1                             // 1个起点位置约束
-        + numSegment                    // numSegment 个位置约束，（不包含末尾）
-        + 1                             // 1个终点速度约束（为0）
-        + (numSegment - 1) * (order-1)  // numSegment - 1个连续性约束
+    // 最后：途经点速度约束（未启用时不限制）
+    const int numSegment = static_cast<int>(restrictArea.size()) - 1; // 分段数量
+    const int continuity = std::min(_maxdx, order-1);
+    VecXd low = VecXd::Zero(
+        1                              // 1个起点速度约束
+        + numSegment + 1               // 所有控制点的位置约束
+        + 1                            // 1个终点速度约束
+        + (numSegment - 1) * continuity // numSegment - 1个连续性约束
+        + (numSegment - 1)             // numSegment - 1个途经点速度约束
     );
     int atline = 0;
     // 起点速度约束
     low(atline++) = initVelocityLow;
-    // 每个segment的中间点约束
+    // 每个控制点的位置约束
     for(const auto & i : restrictArea){
         low(atline++) = std::min(i(0), i(1));
     }
-    // 终点速度约束（为0）
-    low(atline++) = 0.0;
+    // 终点速度约束，默认不限制
+    low(atline++) = -std::numeric_limits<double>::infinity();
     // 安全飞行走廊交集点的连续性约束 = 0
+    atline += (numSegment - 1) * continuity;
+    // 途经点速度约束，未启用时不限制
+    for(int i = 1; i < numSegment; i++){
+        low(atline++) = -std::numeric_limits<double>::infinity();
+    }
     return low;
 }
 
@@ -340,25 +473,34 @@ MinimumSnap::VecXd MinimumSnap::generateUp(const std::vector<Eigen::Vector2f>& r
     // 按顺序：
     // 0：起点速度约束
     // 1：起点位置约束
-    // 2~numSegment+1：每个segment的中间点约束
-    // numSegment+2：终点速度约束（为0）
+    // 2~numSegment+1：每个控制点的位置约束
+    // numSegment+2：终点速度约束（默认不限制）
     // 其余：连续性约束（等于0）
-    int numSegment = static_cast<int>(restrictArea.size()) - 1; // 飞行走廊的数量
-    VecXd up = VecXd::Zero(1        // 1个起点速度约束
-        + numSegment                    // numSegment 个位置约束，（不包含末尾）
-        + 1                             // 1个终点约束
-        + 1                             // 1个终点速度约束（为0）
-        + (numSegment - 1) * (order-1));// numSegment - 1个连续性约束
+    // 最后：途经点速度约束（未启用时不限制）
+    const int numSegment = static_cast<int>(restrictArea.size()) - 1; // 飞行走廊的数量
+    const int continuity = std::min(_maxdx, order-1);
+    VecXd up = VecXd::Zero(
+        1                              // 1个起点速度约束
+        + numSegment + 1               // 所有控制点的位置约束
+        + 1                            // 1个终点速度约束
+        + (numSegment - 1) * continuity // numSegment - 1个连续性约束
+        + (numSegment - 1)             // numSegment - 1个途经点速度约束
+    );
     int atline = 0;
     // 起点速度约束
     up(atline++) = initVelocityUp;
-    // 每个segment的中间点约束
+    // 每个控制点的位置约束
     for(const auto & i : restrictArea){
         up(atline++) = std::max(i(0), i(1));
     }
-    // 终点速度约束（为0）
-    up(atline++) = 0.0;
+    // 终点速度约束，默认不限制
+    up(atline++) = std::numeric_limits<double>::infinity();
     // 安全飞行走廊交集点的连续性约束 = 0
+    atline += (numSegment - 1) * continuity;
+    // 途经点速度约束，未启用时不限制
+    for(int i = 1; i < numSegment; i++){
+        up(atline++) = std::numeric_limits<double>::infinity();
+    }
     return up;
 }
 
@@ -420,224 +562,191 @@ std::vector<Eigen::Vector2f> MinimumSnap::evaluateEquation(const std::vector<dou
 }
 
 std::vector<Eigen::Vector2f> MinimumSnap::lineDecoder(const std::vector<double>& timeAllocated, int index, const MatXd& solutionx, const MatXd& solutiony, bool normT) {
-    std::vector<Eigen::Vector2f> op;
-    if(normT){
-        auto reduceTime = timeAllocated[index];
-        while(reduceTime > 0.01f){
-            auto x = solutionx(index, solutionx.cols() - 1);
-            auto y = solutiony(index, solutiony.cols() - 1);
-            for (int j = 1; j < solutionx.cols(); j++){
-                int at = static_cast<int>(solutionx.cols()) - 1 - j;
-                double tau = (timeAllocated[index] - reduceTime) / timeAllocated[index];
-                x += solutionx(index, at) * pow(tau, j);
-                y += solutiony(index, at) * pow(tau, j);
-            }
-            // 路径分10段即可达标，无需使用bresenham算法
-            reduceTime -= timeAllocated[index] / 10.f;
-            op.emplace_back(x, y);
+    std::vector<Eigen::Vector2f> points;
+    // 路径分10段即可达标，无需使用bresenham算法。
+    for(int i = 0; i <= 10; i++){
+        double t = i / 10.;
+        if(!normT){
+            t *= timeAllocated[index];
         }
-        auto x = solutionx(index, solutionx.cols() - 1);
-        auto y = solutiony(index, solutiony.cols() - 1);
-        for (int j = 1; j < solutionx.cols(); j++){
-            int at = static_cast<int>(solutionx.cols()) - 1 - j;
-            x += solutionx(index, at);
-            y += solutiony(index, at);
+
+        double x = 0.;
+        double y = 0.;
+        // 系数按降幂存放，Horner法同时适用于物理时间和归一化时间。
+        for(int j = 0; j < solutionx.cols(); j++){
+            x = x * t + solutionx(index, j);
+            y = y * t + solutiony(index, j);
         }
-        op.emplace_back(x, y);
-    }else{
-        auto reduceTime = timeAllocated[index];
-        while(reduceTime > 0.01f){
-            auto x = solutionx(index, solutionx.cols() - 1);
-            auto y = solutiony(index, solutiony.cols() - 1);
-            for (int j = 1; j < solutionx.cols(); j++){
-                int at = static_cast<int>(solutionx.cols()) - 1 - j;
-                x += solutionx(index, at) * pow(timeAllocated[index] - reduceTime, j);
-                y += solutiony(index, at) * pow(timeAllocated[index] - reduceTime, j);
-            }
-            // 路径分10段即可达标，无需使用bresenham算法
-            reduceTime -= timeAllocated[index] / 10.f;
-            op.emplace_back(x, y);
-        }
-        auto x = solutionx(index, solutionx.cols() - 1);
-        auto y = solutiony(index, solutiony.cols() - 1);
-        for (int j = 1; j < solutionx.cols(); j++){
-            int at = static_cast<int>(solutionx.cols()) - 1 - j;
-            x += solutionx(index, at) * pow(timeAllocated[index], j);
-            y += solutiony(index, at) * pow(timeAllocated[index], j);
-        }
-        op.emplace_back(x, y);
+        points.emplace_back(x, y);
     }
-    return op;
-};
+    return points;
+}
 
 MinimumSnap::MatXd MinimumSnap::closeSolver(const std::vector<double>& timeAllocated, const std::vector<float>& pathm) const{
-    int order_ = _maxdx;
-    decltype(timeAllocated) &segments_time = timeAllocated;
-    const int poly_order = 2 * order_ - 1;
-    const int num_poly_coeff = poly_order + 1;
-    const int num_segments = static_cast<int>(segments_time.size());
+    // 旧单轴接口只负责转换输入，实际求解复用Item接口。
+    std::vector<Item> items(pathm.size());
+    for(size_t i = 0; i < items.size(); i++){
+        items[i].xy = Eigen::Vector2f(pathm[i], 0.f);
+    }
+    return closeSolver(timeAllocated, items, false).first;
+}
 
-    const int num_all_poly_coeff = num_poly_coeff * num_segments;
+std::pair<MinimumSnap::MatXd, MinimumSnap::MatXd> MinimumSnap::closeSolver(
+    const std::vector<double>& timeAllocated,
+    const std::vector<SolveInput::Item>& items,
+    bool normT
+) const{
+    if(!validTimes(timeAllocated, items.size(), order, _maxdx)){
+        return {};
+    }
 
-    const int A_block_rows = 2 * order_;
-    const int A_block_cols = num_poly_coeff;
-    MatXd A = MatXd::Zero(num_segments * A_block_rows, num_segments * A_block_cols);
+    std::vector<PointPair> corridor;
+    for(const auto& item : items){
+        corridor.push_back({item.xy.x(), item.xy.y(), item.xy.x(), item.xy.y()});
+    }
 
-    for (int i = 0; i < num_segments; ++i){
-        int row = i * A_block_rows;
-        int col = i * A_block_cols;
-        MatXd sub_A = MatXd::Zero(A_block_rows, A_block_cols);
-        for (int j = 0; j < order_; ++j){
-            for (int k = 0; k < num_poly_coeff; ++k){
-                if (k < j){
-                    continue;
-                }
-                if (k == j){
-                    sub_A(j, num_poly_coeff - 1 - k) = Axx(k, j);
-                }
-                else{
-                    sub_A(j, num_poly_coeff - 1 - k) = 0.;
-                }
-                sub_A(j + order_, num_poly_coeff - 1 - k) = Axx(k, j) * pow(segments_time[i], k - j);
+    for(const auto& item : items){
+        if(!item.xy.allFinite() || (item.useVxvy && !item.vxvy.allFinite())){
+            return {};
+        }
+    }
+
+    auto area = postProcess(corridor);
+    MatXd A = generateA(timeAllocated, normT);
+
+    // 约束行在generateA、generateLow和generateUp中一次性确定。
+    // 下面只根据Item填写已存在约束行的边界值，不增加或删除约束行。
+    const int numItems = static_cast<int>(items.size());
+    const int endVelocityRow = numItems + 1;
+    const int interiorVelocityRow = A.rows() - (numItems - 2);
+    auto makeBounds = [&](const std::vector<Eigen::Vector2f>& axisArea, int axis)
+        -> std::pair<VecXd, VecXd>{
+        VecXd low = generateLow(axisArea);
+        VecXd up = generateUp(axisArea);
+        for(size_t i = 0; i < items.size(); i++){
+            if(!items[i].useVxvy){
+                continue;
             }
-        }
-        A.block(row, col, A_block_rows, A_block_cols) = sub_A;
-    }
-    const int num_valid_variables = (num_segments + 1) * order_;
-    const int num_fixed_variables = 2 * order_ + (num_segments - 1);
-    MatXd C_T = MatXd::Zero(num_all_poly_coeff, num_valid_variables);
-    for (int i = 0; i < num_all_poly_coeff; ++i){
-        if (i < order_){
-            C_T(i, i) = 1.0;
-            continue;
-        }
-        if (i >= num_all_poly_coeff - order_){
-            const unsigned int delta_index = i - (num_all_poly_coeff - order_);
-            C_T(i, num_fixed_variables - order_ + delta_index) = 1.0;
-            continue;
-        }
-        if ((i % order_ == 0u) && (i / order_ % 2u == 1u)){
-            const unsigned int index = i / (2u * order_) + order_;
-            C_T(i, index) = 1.0;
-            continue;
-        }
-        if ((i % order_ == 0u) && (i / order_ % 2u == 0u)){
-            const unsigned int index = i / (2u * order_) + order_ - 1u;
-            C_T(i, index) = 1.0;
-            continue;
-        }
-        if ((i % order_ != 0u) && (i / order_ % 2u == 1u)){
-            const unsigned int temp_index_0 = i / (2 * order_) * (2 * order_) + order_;
-            const unsigned int temp_index_1 = i / (2 * order_) * (order_ - 1) + i - temp_index_0 - 1;
-            C_T(i, num_fixed_variables + temp_index_1) = 1.0;
-            continue;
-        }
-        if ((i % order_ != 0u) && (i / order_ % 2u == 0u)){
-            const unsigned int temp_index_0 = (i - order_) / (2 * order_) * (2 * order_) + order_;
-            const unsigned int temp_index_1 =
-                (i - order_) / (2 * order_) * (order_ - 1) + (i - order_) - temp_index_0 - 1;
-            C_T(i, num_fixed_variables + temp_index_1) = 1.0;
-            continue;
-        }
-    }
 
-    MatXd Q = MatXd::Zero(num_all_poly_coeff, num_all_poly_coeff);
-    for (int k = 0u; k < num_segments; ++k){
-        MatXd sub_Q = MatXd::Zero(num_poly_coeff, num_poly_coeff);
-        for (int i = 0u; i <= poly_order; ++i){
-            for (int l = 0u; l <= poly_order; ++l){
-                if (num_poly_coeff - i <= order_ || num_poly_coeff - l <= order_){
-                    continue;
-                }
-                sub_Q(i, l) = Axx(poly_order - i, order_) * Axx(poly_order - l, order_) /
-                              static_cast<double>(poly_order - i + poly_order - l - (2 * order_ - 1)) *
-                              std::pow(segments_time[k], poly_order - i + poly_order - l - (2 * order_ - 1));
+            const int positionRow = static_cast<int>(i) + 1;
+            low(positionRow) = items[i].xy(axis);
+            up(positionRow) = low(positionRow);
+
+            int velocityRow = 0;
+            if(i + 1 == items.size()){
+                velocityRow = endVelocityRow;
+            }else if(i > 0){
+                velocityRow = interiorVelocityRow + static_cast<int>(i) - 1;
             }
+            low(velocityRow) = items[i].vxvy(axis);
+            up(velocityRow) = low(velocityRow);
         }
-        const unsigned int row = k * num_poly_coeff;
-        Q.block(row, row, num_poly_coeff, num_poly_coeff) = sub_Q;
+        return std::make_pair(low, up);
+    };
+
+    const auto xBounds = makeBounds(area.first, 0);
+    const auto yBounds = makeBounds(area.second, 1);
+    MatXd low(A.rows(), 2);
+    MatXd up(A.rows(), 2);
+    low.col(0) = xBounds.first;
+    low.col(1) = yBounds.first;
+    up.col(0) = xBounds.second;
+    up.col(1) = yBounds.second;
+
+    // 位置、连续性和指定速度约束是等式，未指定的首末速度约束不参与闭式求解。
+    std::vector<int> equalityRows;
+    for(int i = 0; i < A.rows(); i++){
+        if(low.row(i).allFinite()){
+            equalityRows.push_back(i);
+        }
     }
 
-    MatXd R = C_T.transpose() * A.transpose().inverse() * Q * A.inverse() * C_T;
-    VecXd d_selected = VecXd::Zero(num_valid_variables);
-    for (int i = 0; i < num_all_poly_coeff; ++i){
-        if (i == 0){
-            d_selected[i] = pathm[0];
-            continue;
+    MatXd equality(static_cast<int>(equalityRows.size()), A.cols());
+    MatXd target(static_cast<int>(equalityRows.size()), 2);
+    for(size_t i = 0; i < equalityRows.size(); i++){
+        double scale = A.row(equalityRows[i]).norm();
+        if(!std::isfinite(scale) || scale == 0.){
+            return {};
         }
-        if (i == 1u && order_ >= 2){
-            // d_selected[i] = waypoints_vel[0];
-            d_selected[i] = 0;
-            continue;
-        }
-        if (i == 2u && order_ >= 3){
-            // d_selected[i] = waypoints_acc[0];
-            d_selected[i] = 0;
-            continue;
-        }
-        if (i == num_all_poly_coeff - order_ + 2 && order_ >= 3){
-            // d_selected(num_fixed_variables - order_ + 2) = waypoints_acc[1];
-            d_selected(num_fixed_variables - order_ + 2) = 0;
-            continue;
-        }
-        if (i == num_all_poly_coeff - order_ + 1 && order_ >= 2){
-            // d_selected(num_fixed_variables - order_ + 1) = waypoints_vel[1];
-            d_selected(num_fixed_variables - order_ + 1) = 0;
-            continue;
-        }
-        if (i == num_all_poly_coeff - order_){
-            d_selected(num_fixed_variables - order_) = pathm[num_segments];
-            continue;
-        }
-        if ((i % order_ == 0u) && (i / order_ % 2u == 0u)){
-            const unsigned int index = i / (2 * order_) + order_ - 1;
-            d_selected(index) = pathm[i / (2 * order_)];
-            continue;
-        }
+        equality.row(static_cast<int>(i)) = A.row(equalityRows[i]) / scale;
+        target.row(static_cast<int>(i)) = low.row(equalityRows[i]) / scale;
     }
-    MatXd R_PP = R.block(num_fixed_variables, num_fixed_variables,
-                         num_valid_variables - num_fixed_variables,
-                         num_valid_variables - num_fixed_variables);
-    VecXd d_F = d_selected.head(num_fixed_variables);
-    MatXd R_FP = R.block(0, num_fixed_variables, num_fixed_variables,
-                         num_valid_variables - num_fixed_variables);
 
-    MatXd d_optimal = -R_PP.inverse() * R_FP.transpose() * d_F;
-
-    d_selected.tail(num_valid_variables - num_fixed_variables) = d_optimal;
-    VecXd d = C_T * d_selected;
-
-    VecXd P = A.inverse() * d;
-
-    MatXd poly_coeff_mat = MatXd::Zero(num_segments, num_poly_coeff);
-    for (int i = 0; i < num_segments; ++i){
-        poly_coeff_mat.block(i, 0, 1, num_poly_coeff) =
-            P.block(num_poly_coeff * i, 0, num_poly_coeff, 1).transpose();
+    // p=p0+Nz：p0满足等式，N的列张成等式的零空间。
+    // 在自由变量z上最小化二次型，两个方向共用同一个分解。
+    Eigen::FullPivLU<MatXd> decomposition(equality);
+    MatXd solution = decomposition.solve(target);
+    if((equality * solution - target).cwiseAbs().maxCoeff() > 1e-7){
+        return {};
     }
-    return poly_coeff_mat;
+
+    if(decomposition.dimensionOfKernel() > 0){
+        MatXd kernel = decomposition.kernel();
+        Eigen::HouseholderQR<MatXd> qr(kernel);
+        kernel = qr.householderQ() * MatXd::Identity(kernel.rows(), kernel.cols());
+
+        MatXd Q = generateQ(timeAllocated, normT).selfadjointView<Eigen::Upper>();
+        Q /= std::max(Q.cwiseAbs().maxCoeff(), 1e-12);
+        MatXd reducedQ = kernel.transpose() * Q * kernel;
+        MatXd rhs = -kernel.transpose() * Q * solution;
+        MatXd freeValues = reducedQ.completeOrthogonalDecomposition().solve(rhs);
+        solution += kernel * freeValues;
+    }
+
+    if(!solution.allFinite() || (equality * solution - target).cwiseAbs().maxCoeff() > 1e-6){
+        return {};
+    }
+    return unpack(solution, order);
 }
 
 bool MinimumSnap::lineInObsticle(const Eigen::Vector2f &start, const Eigen::Vector2f &end) const{
     std::lock_guard<std::mutex> lock(mapMutex);
-    // safty check
-    if(sfc.isOutside(start.x(), start.y()) || sfc.isOutside(end.x(), end.y())){
+
+    if(!sfc.isUseable() || !std::isfinite(sfc.mapping) || sfc.mapping <= 0.f){
+        return true;
+    }
+
+    // 先检查浮点坐标，再转换为栅格索引，避免非法浮点转整数。
+    auto toCell = [&](const Eigen::Vector2f& point, int& x, int& y){
+        const double cellX =
+            (static_cast<double>(point.x()) - sfc.originPos.x()) / sfc.mapping;
+        const double cellY =
+            (static_cast<double>(point.y()) - sfc.originPos.y()) / sfc.mapping;
+        if(!std::isfinite(cellX) || !std::isfinite(cellY) ||
+           cellX < 0. || cellX >= sfc.map.cols() ||
+           cellY < 0. || cellY >= sfc.map.rows()){
+            return false;
+        }
+        x = static_cast<int>(cellX);
+        y = static_cast<int>(cellY);
+        return true;
+    };
+
+    int x0, y0, x1, y1;
+    if(!toCell(start, x0, y0) || !toCell(end, x1, y1)){
         // outside map = true
         // std::cout << "\033[31mLine out of map: [" << start.x() << " " << start.y() << "] --> [" << end.x() << " " << end.y() << "]\033[0m" << std::endl;
         return true;
     }
 
-    auto x0 = static_cast<int>((start.x() - sfc.originPos.x()) / sfc.mapping);
-    auto y0 = static_cast<int>((start.y() - sfc.originPos.y()) / sfc.mapping);
-    auto x1 = static_cast<int>((end.x() - sfc.originPos.x()) / sfc.mapping);
-    auto y1 = static_cast<int>((end.y() - sfc.originPos.y()) / sfc.mapping);
     int dx = std::abs(x1 - x0), dy = std::abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
     int sy = (y0 < y1) ? 1 : -1;
     int err = dx - dy;
+    // 严格模式遇到一个障碍栅格即判碰撞，非严格模式允许检测线擦过两个栅格；整条线在障碍物内仍然判碰撞。
+    constexpr int obstacleTolerance = 2;
+    int obstacleCount = 0;
+    bool hasFreeCell = false;
 
     while (true) {
         // 检查当前点是否为障碍物
-        if (0 == sfc.map(y0, x0)) return true;
+        if (0 == sfc.map(y0, x0)){
+            if(strictCollision || ++obstacleCount > obstacleTolerance){
+                return true;
+            }
+        }else{
+            hasFreeCell = true;
+        }
         if (x0 == x1 && y0 == y1) break;
 
         int e2 = 2 * err;
@@ -650,7 +759,7 @@ bool MinimumSnap::lineInObsticle(const Eigen::Vector2f &start, const Eigen::Vect
             y0 += sy;
         }
     }
-    return false;
+    return !hasFreeCell;
 }
 
 std::pair<MinimumSnap::VecXd, MinimumSnap::VecXd> MinimumSnap::initXY(const std::vector<double>& timeAllocated, const std::vector<Eigen::Vector2f>& path) const{
@@ -672,377 +781,248 @@ std::pair<MinimumSnap::VecXd, MinimumSnap::VecXd> MinimumSnap::initXY(const std:
 
 std::pair<MinimumSnap::MatXd, MinimumSnap::MatXd> MinimumSnap::osqpExecute(
     const std::vector<double>& timeAllocated,
-    const std::vector<Eigen::Vector2f>& path,
+    const std::vector<SolveInput::Item>& items,
     const std::vector<std::array<float, 4>>& corridor,
-    float initVxMax,
-    float initVyMax,
-    float initVxMin,
-    float initVyMin,
-    bool normT) const
-{
-    if(path.size()<=1){
-        // 奇葩事件
+    bool normT
+) const{
+    if(!validTimes(timeAllocated, items.size(), order, _maxdx)){
         return {};
     }
-    // 后处理飞行走廊，生成交集
-    auto uarea = postProcess(corridor);
-    // 生成Q矩阵
-    Eigen::SparseMatrix<double> Q = generateQ(timeAllocated, normT).sparseView();
-    // 生成A矩阵
-    Eigen::SparseMatrix<double> A = generateA(timeAllocated, normT).sparseView();
-    // 生成c向量
-    VecXd c = VecXd::Zero(static_cast<int>(order * timeAllocated.size()));
 
-    auto xyinit = initXY(timeAllocated, path); // timesize = corridor.size() = path.size() - 1
-    if(normT){
-        for(int i = 0; i < static_cast<int>(timeAllocated.size()); ++i){
-            xyinit.first(i * order + 1) = path[i + 1].x() - path[i].x();
-            xyinit.second(i * order + 1) = path[i + 1].y() - path[i].y();
+    if(corridor.size() != items.size()){
+        return {};
+    }
+    for(size_t i = 0; i < items.size(); i++){
+        const auto& box = corridor[i];
+        if(!items[i].xy.allFinite() ||
+           (items[i].useVxvy && !items[i].vxvy.allFinite()) ||
+           !std::all_of(box.begin(), box.end(), [](float value){return std::isfinite(value);}) ||
+           box[0] > box[2] || box[1] > box[3]){
+            return {};
         }
     }
 
-    // x方向
-    auto low = generateLow(uarea.first, initVxMin);
-    auto up = generateUp(uarea.first, initVxMax);
+    auto area = postProcess(corridor);
+    MatXd denseA = generateA(timeAllocated, normT);
 
-    OsqpEigen::Solver solver;
-    solver.data()->setNumberOfVariables(static_cast<int>(Q.cols()));
-    solver.data()->setNumberOfConstraints(static_cast<int>(A.rows()));
-    solver.data()->setHessianMatrix(Q);
-    solver.data()->setGradient(c);
-    solver.data()->setLinearConstraintsMatrix(A);
-    solver.data()->setLowerBound(low);
-    solver.data()->setUpperBound(up);
-    solver.settings()->setTimeLimit(0.01);
-    solver.settings()->setMaxIteration(500);
-    solver.settings()->setRho(1e-2);
-    solver.settings()->setAbsoluteTolerance(1e-2);
-    solver.settings()->setRelativeTolerance(2e-3);
-    solver.settings()->setPolish(true);
-    solver.settings()->setVerbosity(false);
-    solver.initSolver();
-    // 初始化
-    solver.setPrimalVariable(xyinit.first);
-    auto paramError = solver.solveProblem();// 求解
-    if(paramError != OsqpEigen::ErrorExitFlag::NoError){
-        std::cout<<"求解minimum snap参数设置错误, 切换为无约束求解"<<std::endl;
-        return {};
-    }
-    auto status = solver.getStatus();
-    if (status != OsqpEigen::Status::Solved &&
-        status != OsqpEigen::Status::SolvedInaccurate &&
-        status != OsqpEigen::Status::MaxIterReached &&
-        status != OsqpEigen::Status::TimeLimitReached
-    ){
-        std::cout<<"错误发生在求解x的minimum snap, 切换为无约束求解"<<std::endl;
-        return {};
-    }
-    VecXd resultx = solver.getSolution();
-    solver.clearSolver();
-
-    // y方向
-    low = generateLow(uarea.second, initVyMin);
-    up = generateUp(uarea.second, initVyMax);
-
-    solver.data()->setLowerBound(low);
-    solver.data()->setUpperBound(up);
-    solver.initSolver();
-    // 初始化
-    solver.setPrimalVariable(xyinit.second);
-    solver.solveProblem();// 求解
-    status = solver.getStatus();
-    if (status != OsqpEigen::Status::Solved &&
-        status != OsqpEigen::Status::SolvedInaccurate &&
-        status != OsqpEigen::Status::MaxIterReached &&
-        status != OsqpEigen::Status::TimeLimitReached
-    ){
-        std::cout<<"错误发生在求解y的minimum snap, 切换为无约束求解"<<std::endl;
-        return {};
-    }
-    VecXd resulty = solver.getSolution();
-
-    // auto op = evaluateEquation(timeAllocated, resultx, resulty);
-    // result: [time.size() * order, 1] --> [time.size(), order]
-    auto rx = Eigen::Map<MatXd>(resultx.data(), order, static_cast<int>(timeAllocated.size())).transpose();
-    auto ry = Eigen::Map<MatXd>(resulty.data(), order, static_cast<int>(timeAllocated.size())).transpose();
-
-    // 将每一行的系数顺序反转，使得列0为最高次幂，最后一列为常数项。
-    // 这样输出格式与 closeSolver 返回的 poly_coeff_mat 保持一致，
-    // 以便后续的 lineDecoder（依赖于末列为常数项）能够正确解码轨迹。
-    MatXd rx_rev = MatXd::Zero(rx.rows(), rx.cols());
-    MatXd ry_rev = MatXd::Zero(ry.rows(), ry.cols());
-    for (int i = 0; i < rx.rows(); ++i) {
-        for (int j = 0; j < rx.cols(); ++j) {
-            rx_rev(i, j) = rx(i, rx.cols() - 1 - j);
-            ry_rev(i, j) = ry(i, ry.cols() - 1 - j);
-            // nan
-            if (rx_rev(i, j) != rx_rev(i, j) || ry_rev(i, j) != ry_rev(i, j)){
-                std::cout << "求解器爆了，切换为无约束求解" << std::endl;
-                return {};
+    // 约束行在generateA、generateLow和generateUp中一次性确定。
+    // 下面只根据Item填写已存在约束行的边界值，不增加或删除约束行。
+    const int numItems = static_cast<int>(items.size());
+    const int endVelocityRow = numItems + 1;
+    const int interiorVelocityRow = denseA.rows() - (numItems - 2);
+    auto makeBounds = [&](const std::vector<Eigen::Vector2f>& axisArea, int axis)
+        -> std::pair<VecXd, VecXd>{
+        VecXd low = generateLow(axisArea);
+        VecXd up = generateUp(axisArea);
+        for(size_t i = 0; i < items.size(); i++){
+            if(!items[i].useVxvy){
+                continue;
             }
+
+            const int positionRow = static_cast<int>(i) + 1;
+            low(positionRow) = items[i].xy(axis);
+            up(positionRow) = low(positionRow);
+
+            int velocityRow = 0;
+            if(i + 1 == items.size()){
+                velocityRow = endVelocityRow;
+            }else if(i > 0){
+                velocityRow = interiorVelocityRow + static_cast<int>(i) - 1;
+            }
+            low(velocityRow) = items[i].vxvy(axis);
+            up(velocityRow) = low(velocityRow);
         }
+        return std::make_pair(low, up);
+    };
+
+    const auto xBounds = makeBounds(area.first, 0);
+    const auto yBounds = makeBounds(area.second, 1);
+    MatXd low(denseA.rows(), 2);
+    MatXd up(denseA.rows(), 2);
+    low.col(0) = xBounds.first;
+    low.col(1) = yBounds.first;
+    up.col(0) = xBounds.second;
+    up.col(1) = yBounds.second;
+
+    // 同步缩放约束行和上下界，避免物理时间较大时高次项造成尺度差异。
+    for(int i = 0; i < denseA.rows(); i++){
+        const double scale = denseA.row(i).norm();
+        if(!std::isfinite(scale) || scale == 0.){
+            return {};
+        }
+        denseA.row(i) /= scale;
+        low.row(i) /= scale;
+        up.row(i) /= scale;
     }
 
-    return {rx_rev, ry_rev};
+    MatXd denseQ = generateQ(timeAllocated, normT);
+    denseQ /= std::max(denseQ.cwiseAbs().maxCoeff(), 1e-12);
+    Eigen::SparseMatrix<double> Q = denseQ.sparseView();
+    Eigen::SparseMatrix<double> A = denseA.sparseView();
+    VecXd c = VecXd::Zero(A.cols());
+    MatXd solution(A.cols(), 2);
+
+    // x、y两个方向使用相同的Q和A，仅上下界不同。
+    for(int axis = 0; axis < 2; axis++){
+        VecXd axisLow = low.col(axis);
+        VecXd axisUp = up.col(axis);
+
+        OsqpEigen::Solver solver;
+        solver.settings()->setVerbosity(false);
+        solver.settings()->setPolish(true);
+        solver.settings()->setAbsoluteTolerance(1e-8);
+        solver.settings()->setRelativeTolerance(1e-8);
+        solver.settings()->setMaxIteration(20000);
+        solver.settings()->setTimeLimit(0.1);
+        solver.data()->setNumberOfVariables(A.cols());
+        solver.data()->setNumberOfConstraints(A.rows());
+
+        if(!solver.data()->setHessianMatrix(Q) ||
+           !solver.data()->setGradient(c) ||
+           !solver.data()->setLinearConstraintsMatrix(A) ||
+           !solver.data()->setLowerBound(axisLow) ||
+           !solver.data()->setUpperBound(axisUp) ||
+           !solver.initSolver()){
+            return {};
+        }
+        if(solver.solveProblem() != OsqpEigen::ErrorExitFlag::NoError ||
+           (solver.getStatus() != OsqpEigen::Status::Solved &&
+            solver.getStatus() != OsqpEigen::Status::SolvedInaccurate)){
+            std::cout << "OSQP未收敛，方向=" << axis
+                      << " 状态=" << static_cast<int>(solver.getStatus()) << std::endl;
+            return {};
+        }
+
+        solution.col(axis) = solver.getSolution();
+        VecXd values = A * solution.col(axis);
+        if(!solution.col(axis).allFinite() ||
+           (axisLow - values).maxCoeff() > 1e-5 ||
+           (values - axisUp).maxCoeff() > 1e-5){
+            return {};
+        }
+    }
+    return unpack(solution, order);
 }
 
 MinimumSnap::SolveOutput MinimumSnap::_solve(
     const std::vector<double>& timeAllocated,
-    const std::vector<Eigen::Vector2f>& path,
+    const std::vector<SolveInput::Item>& items,
     float maxCorridorRange,
     float corridorShrink,
     int maxIter,
-    float initVxMax,
-    float initVyMax,
-    float initVxMin,
-    float initVyMin,
-    bool normT)
-{
-    if (timeAllocated.size() + 1 != path.size()) {
-        // red
-        std::cout << "\033[31mError: timeAllocated size + 1 must equal to path size. Now:"<<
-        timeAllocated.size() << " + 1 != " << path.size() << "\033[0m" << std::endl;
+    bool normT
+){
+    if(!validTimes(timeAllocated, items.size(), order, _maxdx)){
         return {};
     }
-    if(sfc.isUseable() == false && maxIter == 1){
-        // yellow
-        std::cout << "\033[33mWarning: map is not avaliable, switch to no collision check mode\033[0m" << std::endl;
-        maxIter = 1;
-    }
 
-    // 用于迭代修改
-    auto ta = timeAllocated;
-    auto pa = path;
-    auto corridor = sfc.getCorridor(pa, maxCorridorRange, corridorShrink).corridor;
+    std::vector<PointPair> corridor;
+    bool corridorInitialized = false;
+    auto solveOnce = [&](const std::vector<double>& times, const std::vector<Item>& points){
+        if(!corridorInitialized){
+            std::vector<Eigen::Vector2f> path;
+            for(const auto& item : points){
+                path.push_back(item.xy);
+            }
 
-    MinimumSnap::SolveOutput result;
-    result.path = pa;
-    MinimumSnap::MatXd resultx, resulty;
-    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
-    auto deltat = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-    bool tle = false;
-
-    int round = 0;
-    int iterLeft = maxIter;
-    std::vector<int> badIndex;
-
-    while(iterLeft --> 0){
-        // 每轮根据当前 corridor 调用一次 OSQP 求解
-        std::tie(resultx, resulty) = osqpExecute(ta, pa, corridor, initVxMax, initVyMax, initVxMin, initVyMin, normT);
-        if(resultx.rows() == 0 || resulty.rows() == 0){
-            // 求解失败，退化
-            std::cout << "\033[33mWarning: osqpExecute failed, fallback to close solver\033[0m" << std::endl;
-            result = _solve(timeAllocated, path, maxIter, initVxMax, initVyMax, initVxMin, initVyMin, normT);
-            return result;
+            if(maxCorridorRange > 0 && sfc.isUseable()){
+                corridor = sfc.getCorridor(path, maxCorridorRange, corridorShrink).corridor;
+            }else{
+                for(const auto& point : path){
+                    corridor.push_back({point.x(), point.y(), point.x(), point.y()});
+                }
+            }
+            corridorInitialized = true;
+        }
+        if(corridor.size() != points.size()){
+            return std::pair<MatXd, MatXd>{};
         }
 
-        badIndex.clear();
-        for(int a = 0; a < resultx.rows(); a++){
-            auto curve = lineDecoder(ta, a, resultx, resulty, normT);
-            for(size_t b = 0; b < curve.size() - 1; b++){
-                if(lineInObsticle(curve[b], curve[b+1])){
-                    badIndex.push_back(a);
-                    break;
+        for(size_t i = 0; i < points.size(); i++){
+            if(!points[i].autoCorridor){
+                corridor[i] = points[i].corridor;
+            }
+        }
+        return osqpExecute(times, points, corridor, normT);
+    };
+    auto sample = [&](const std::vector<double>& times, int index, const MatXd& x, const MatXd& y){
+        return lineDecoder(times, index, x, y, normT);
+    };
+    auto collision = [&](const Eigen::Vector2f& start, const Eigen::Vector2f& end){
+        return sfc.isUseable() && lineInObsticle(start, end);
+    };
+    // 交替插入控制点和收紧相邻自动走廊，避免每轮都重新生成整条走廊。
+    auto update = [&](std::vector<double>& times, std::vector<Item>& points,
+                      const std::vector<int>& bad, int round){
+        if(round % 2 == 0){
+            auto inserted = insertMidpoints(times, points, bad);
+            for(auto i : inserted){
+                const auto& point = points[i].xy;
+                PointPair bound;
+                if(maxCorridorRange > 0 && sfc.isUseable()){
+                    bound = sfc.getBound(point.x(), point.y(), maxCorridorRange);
+                    bound = SfcSquare::shrink(bound, corridorShrink, {point});
+                }else{
+                    bound = {point.x(), point.y(), point.x(), point.y()};
+                }
+                points[i].corridor = bound;
+                points[i].autoCorridor = true;
+                corridor.insert(corridor.begin() + i, bound);
+            }
+        }else{
+            for(auto i : bad){
+                if(points[i].autoCorridor){
+                    float len = std::max(std::abs(corridor[i][2] - corridor[i][0]),
+                        std::abs(corridor[i][3] - corridor[i][1]));
+                    if(len > 0.f){
+                        corridor[i] = SfcSquare::shrink(corridor[i], len * 0.5f, {points[i].xy});
+                    }
+                }
+                if(points[i + 1].autoCorridor){
+                    float len = std::max(std::abs(corridor[i + 1][2] - corridor[i + 1][0]),
+                        std::abs(corridor[i + 1][3] - corridor[i + 1][1]));
+                    if(len > 0.f){
+                        corridor[i + 1] = SfcSquare::shrink(corridor[i + 1], len * 0.5f, {points[i + 1].xy});
+                    }
                 }
             }
         }
-        if(badIndex.empty()){
-            round++;
-            break;
-        }
-
-        deltat = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-        if(deltat > timeLimit){
-            round++;
-            tle = true;
-            break;
-        }
-
-        // if(1){
-        if(round++ % 2 == 0 && iterLeft){
-            // 添加更多的控制点
-            int indexSum = 0;
-            for(auto i : badIndex){
-                i += indexSum++;
-                ta.insert(ta.begin() + i + 1, ta[i] * 0.5);
-                ta[i] *= 0.5;
-                Eigen::Vector2f lerper = (pa[i] + pa[i+1]) * 0.5f; // 这里不可以用auto！要不然会nan
-                pa.insert(pa.begin() + i + 1, lerper);
-                auto square_leaper = sfc.getBound(lerper.x(), lerper.y(), maxCorridorRange);
-                if(square_leaper[0] != square_leaper[0]){
-                    std::cout << "fuck Eigen NaN" << std::endl;
-                }
-                square_leaper = SfcSquare::shrink(square_leaper, corridorShrink, {lerper});
-                corridor.insert(corridor.begin() + i + 1, square_leaper);
-            }
-        }else if(iterLeft){
-            // 时间不动，将bad段前后缩小sfc
-            for(auto i : badIndex){
-                // i & i+1
-                float len = std::max(std::abs(corridor[i][2] - corridor[i][0]), std::abs(corridor[i][3] - corridor[i][1]));
-                corridor[i] = SfcSquare::shrink(corridor[i], len * 0.5f, {pa[i]});
-                len = std::max(std::abs(corridor[i+1][2] - corridor[i+1][0]), std::abs(corridor[i+1][3] - corridor[i+1][1]));
-                corridor[i+1] = SfcSquare::shrink(corridor[i+1], len * 0.5f, {pa[i+1]});
-            }
-        }
-    }
-
-    // 超出迭代或者时间限制，最后再求解一次并返回（可能有碰撞）
-    if(tle){
-        std::cout << "\033[33mWarning:[osqp solver iteration] time limit exceeded at iter " << round << "\033[0m" << std::endl;
-    }
-
-    result.path.clear();
-    for(int a = 0; a < resultx.rows(); a++){
-        auto curve = lineDecoder(ta, a, resultx, resulty, normT);
-        result.path.insert(result.path.end(), curve.begin(), curve.end() - 1);
-    }
+    };
+    auto result = iterate(timeAllocated, items, maxIter, timeLimit, solveOnce, sample, collision, update);
     result.corridor = corridor;
-    result.iter = round;
-    result.time = deltat;
-    result.success = true;
     return result;
 }
 
 MinimumSnap::SolveOutput MinimumSnap::_solve(
     const std::vector<double>& timeAllocated,
-    const std::vector<Eigen::Vector2f>& path,
+    const std::vector<SolveInput::Item>& items,
     int maxIter,
-    float initVxMax,// 下面这些还没用上
-    float initVyMax,
-    float initVxMin,
-    float initVyMin,
-    bool normT)
-{
-    (void) initVxMax;
-    (void) initVyMax;
-    (void) initVxMin;
-    (void) initVyMin;
-    if (timeAllocated.size() + 1 != path.size()) {
-        // red
-        std::cout << "\033[31mError: timeAllocated size + 1 must equal to path size. Now:"<<
-        timeAllocated.size() << " + 1 != " << path.size() << "\033[0m" << std::endl;
+    bool normT
+){
+    if(!validTimes(timeAllocated, items.size(), order, _maxdx)){
         return {};
     }
-    if(sfc.isUseable() == false && maxIter == 1){
-        // yellow
-        std::cout << "\033[33mWarning: map is not avaliable, switch to no collision check mode\033[0m" << std::endl;
-        maxIter = 1;
-    }
-    if(normT){
-        normT = false;
-        std::cout << "\033[33mWarning: normT is not supported in closeSolver, switch to normT = false\033[0m" << std::endl;
-    }
-    auto ta = timeAllocated;
 
-    std::vector<float> pathx, pathy;
-    int current_t = 0;
-    for (int a = 0; a < static_cast<int>(path.size()); a++) {
-        auto p = path[a];
-        // check rep
-        if(a > 0){
-            if(p.x() == path[a-1].x() && p.y() == path[a-1].y()){
-                // yellow
-                std::cout << "\033[33mWarning: repeat point detected, using autofix, pop "<< current_t <<"\033[0m" << std::endl;
-                ta.erase(ta.begin()+current_t);
-                continue;
-            }
-            else{
-                current_t++;
-            }
-        }
-        pathx.push_back(p.x());
-        pathy.push_back(p.y());
-    }
-
-    if(pathx.size() < 2 || pathy.size() < 2 || ta.empty()){
-        // red
-        std::cout << "\033[31mError: path size must be greater than 1\033[0m" << std::endl;
-        return {};
-    }
-    // 估算时间：400算力/ms，需要p^3算力（按4iter计算）
-    else if(pathx.size() > 70){
-        // red
-        std::cout << "\033[31mError: path size is too large("<<pathx.size()<<"), escape with input\033[0m" << std::endl;
-        std::vector<Eigen::Vector2f> op(path.size());
-        for(size_t i = 0; i < path.size(); i++){
-            op[i] = path[i];
-        }
-        MinimumSnap::SolveOutput result;
-        result.path = op;
-        result.corridor.clear();
-        result.iter = 0;
-        result.time = 0.;
-        result.success = false;
-    }
-    else if(pathx.size() > 25){
-        // yellow
-        std::cout << "\033[33mWarning: path size is a little large("<<pathx.size()<<"), may cause performance issue\033[0m" << std::endl;
-    }
-
-    std::chrono::steady_clock::time_point startTime = std::chrono::steady_clock::now();
-    auto deltat = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-    bool tle = false;
-    auto resultx = closeSolver(ta, pathx);
-    auto resulty = closeSolver(ta, pathy);
-    std::vector<int> badIndex;
-    int round = 0;
-    int iterLeft = maxIter;
-    while(iterLeft --> 0){
-        badIndex.clear();
-        for(int a = 0; a < resultx.rows(); a++){
-            auto curve = lineDecoder(ta, a, resultx, resulty, normT);
-            for(size_t b = 0; b<curve.size() - 1; b++){
-                if(lineInObsticle(curve[b], curve[b+1])){
-                    badIndex.push_back(a);
-                    break;
-                }
+    // 闭式后端不生成走廊，但保留碰撞检测迭代。
+    auto solveOnce = [&](const std::vector<double>& times, const std::vector<Item>& points){
+        return closeSolver(times, points, normT);
+    };
+    auto sample = [&](const std::vector<double>& times, int index, const MatXd& x, const MatXd& y){
+        return lineDecoder(times, index, x, y, normT);
+    };
+    auto collision = [&](const Eigen::Vector2f& start, const Eigen::Vector2f& end){
+        return sfc.isUseable() && lineInObsticle(start, end);
+    };
+    // 闭式求解交替插入控制点和压缩碰撞分段的时间。
+    auto update = [&](std::vector<double>& times, std::vector<Item>& points,
+                      const std::vector<int>& bad, int round){
+        if(round % 2 == 0){
+            insertMidpoints(times, points, bad);
+        }else{
+            for(auto i : bad){
+                times[i] *= 0.8;
             }
         }
-        if(badIndex.empty()){
-            round++;
-            break;
-        }
-        deltat = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-        if(deltat > timeLimit){
-            round++;
-            tle = true;
-            break;
-        }
-        if(round++ % 2 == 1 && iterLeft){
-            // test 时间减少的方式，让曲线倾向于走直线。
-            for(auto& i: badIndex){
-                ta[i] *=0.8f;
-            }
-            resultx = closeSolver(ta, pathx);
-            resulty = closeSolver(ta, pathy);
-        }else if(iterLeft){
-            // 添加中间点强制约束。
-            int indexSum = 0;
-            for(auto i: badIndex){
-                i += indexSum++;
-                ta.insert(ta.begin() + i + 1, ta[i] * 0.5);
-                ta[i] *= 0.5;
-                pathx.insert(pathx.begin() + i + 1, (pathx[i] + pathx[i+1]) / 2);
-                pathy.insert(pathy.begin() + i + 1, (pathy[i] + pathy[i+1]) / 2);
-            }
-            resultx = closeSolver(ta, pathx);
-            resulty = closeSolver(ta, pathy);
-        }
-    }
-    if(tle){
-        // yellow
-        std::cout << "\033[33mWarning:[close solver iteration] time limit exceeded\033[0m" << std::endl;
-    }
-    MinimumSnap::SolveOutput result;
-    result.path.clear();
-    for(int a = 0; a< resultx.rows(); a++){
-        auto curve = lineDecoder(ta, a, resultx, resulty, normT);
-        result.path.insert(result.path.end(), curve.begin(), curve.end());
-    }
-    result.corridor.clear();
-    result.iter = round;
-    result.time = deltat;
-    result.success = true;
-    return result;
+    };
+    return iterate(timeAllocated, items, maxIter, timeLimit, solveOnce, sample, collision, update);
 }

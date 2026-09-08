@@ -1,9 +1,17 @@
+/***************
+ * @file minimumSnap.hpp
+ * @brief MinimumSnap类，提供n阶自然样条优化后端，支持自定义速度约束
+ * @author SnifferCaptain
+ ***************/
+
 #pragma once
 #include <Eigen/Dense>
 #include <array>
 #include <eigen3/Eigen/Eigen>
 #include <cmath>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include <OsqpEigen/OsqpEigen.h>
@@ -31,17 +39,22 @@ public:
         Close = 3,          // 闭式求解等式约束路径。
     };
 
-    // @param timeAllocated 时间分配（要求 长度 = 飞行走廊的长度-1 且 =路径长度-1）
-    // @param corridor 飞行走廊（要求 长度=路径的长度）
-    // @param path 路径点
-    // @param start 起点
-    // @param end 终点
+    // @param timeAllocated 各段持续时间，长度为控制点数量减1，单位为秒
+    // @param items 控制点信息；setPath为只设置xy的兼容接口
     // @param maxSpeed 最大速度，仅影响时间分配，默认值是5，不需要详细调整。
     // @param maxAcc 最大加速度，仅影响时间分配，默认值是2，不需要详细调整。
-    // @param normTime 是否对时间进行归一化，使得求解稳定。(实验性，不是论文提及的那个。)
-    // @param collisionIter 在只有路径的求解中，使用碰撞检测并进行迭代优化，提高轨迹安全性。
+    // @param normTime 是否使用段内归一化时间，速度约束的单位不变
+    // @param collisionIter 碰撞检测迭代次数；次数耗尽时，返回的轨迹仍可能有碰撞
     class SolveInput{
     public:
+        struct Item{
+            Eigen::Vector2f xy = Eigen::Vector2f::Zero();   // 控制点坐标
+            Eigen::Vector2f vxvy = Eigen::Vector2f::Zero(); // 经过控制点时的物理速度，单位与xy一致，时间单位为秒
+            bool useVxvy = false;                           // 是否约束速度；开启时同时固定经过xy
+            PointPair corridor = {{0.f, 0.f, 0.f, 0.f}};    // 手动走廊，顺序为xmin、ymin、xmax、ymax
+            bool autoCorridor = true;                       // 自动生成走廊；为false时使用corridor，不参与自动收缩
+        };
+
         SolveInput() = default;
 
         [[nodiscard]] bool haveTimeAllocated() const{return _haveTimeAllocated;}
@@ -53,9 +66,37 @@ public:
             _haveTimeAllocated = true;
         }
 
-        void setPath(std::vector<Eigen::Vector2f> &path){
-            this->path = path;
+        // 替换路径项；已有初速度按覆盖规则写回起点。
+        void setPath(const std::vector<Eigen::Vector2f> &path){
+            items.assign(path.size(), Item{});
+            for(size_t i = 0; i < path.size(); ++i){
+                items[i].xy = path[i];
+                if(i == path.size() - 1){
+                    items[i].useVxvy = true;
+                    items[i].vxvy = Eigen::Vector2f::Zero();
+                }
+            }
+            if(haveInitVelocity()){
+                // 使用已经设置的初始速度
+                setInitVel(this->initVelocity);
+            }
             _havePath = true;
+        }
+
+        // 与 setPath 一样替换整条路径；时间分配及其他求解设置不变。
+        void setItems(const std::vector<Item>& values){
+            items = values;
+            _havePath = true;
+            if(haveInitVelocity()){
+                if(!values.empty() && values[0].useVxvy){
+                    // 覆盖旧设置
+                    this->initVelocity = values[0].vxvy;
+                    _haveInitVelocity = true;
+                }else{
+                    // 使用旧设置
+                    setInitVel(this->initVelocity);
+                }
+            }
         }
 
         void setCollisionCheckIter(int iter){
@@ -73,6 +114,10 @@ public:
         void setInitVel(Eigen::Vector2f vel){
             this->initVelocity = vel;
             _haveInitVelocity = true;
+            if(!items.empty()){
+                items.at(0).vxvy = vel;
+                items.at(0).useVxvy = true;
+            }
         }
 
         void setMaxSpeed(float maxSpeed){
@@ -95,9 +140,8 @@ public:
 
         // 自动获取推荐求解方式
         [[nodiscard]] static MinimumSnap::Backend autoBackend();
-
         [[nodiscard]] const std::vector<double>& getTimeAllocated() const { return timeAllocated; }
-        [[nodiscard]] const std::vector<Eigen::Vector2f>& getPath() const { return path; }
+        [[nodiscard]] const std::vector<Item>& getItems() const { return items; }
         [[nodiscard]] int getIterNum() const { return collisionIteration; }
         [[nodiscard]] MinimumSnap::Backend getBackend() const { return backend; }
         [[nodiscard]] float getMaxCorridorRange() const { return maxCorridorRange; }
@@ -107,19 +151,26 @@ public:
         [[nodiscard]] float getMaxSpeed() const { return maxSpeed; }
         [[nodiscard]] float getMaxAcc() const { return maxAcc; }
         [[nodiscard]] bool getNormTime() const { return normTime; }
+        
+        [[nodiscard]] std::vector<Eigen::Vector2f> getPath() const {
+            std::vector<Eigen::Vector2f> path(items.size());
+            for(size_t i = 0; i < items.size(); ++i){
+                path[i] = items[i].xy;
+            }
+            return path;
+        }
 
     private:
-        // 状态增加2件套：1、改getStatus(注意优先级) 2、改solve前端
         std::vector<double> timeAllocated;
-        std::vector<Eigen::Vector2f> path;
+        std::vector<Item> items;
         Eigen::Vector2f initVelocity = Eigen::Vector2f(0.f, 0.f);
         float maxCorridorRange = std::numeric_limits<float>::max();
         float corridorShrink = 0.f;
         float maxSpeed = 5.f;
         float maxAcc = 2.f;
-        bool normTime = false;
         int collisionIteration = 2;
         MinimumSnap::Backend backend = MinimumSnap::Backend::Close;
+        bool normTime = false;
         bool _haveTimeAllocated = false;
         bool _havePath = false;
         bool _haveInitVelocity = false;
@@ -147,6 +198,9 @@ public:
     // 设置超时限制，单位秒
     void setTL(double tl);
 
+    // 设置严格碰撞模式
+    void setStrictCollision(bool strict = true);
+
     // 设置碰撞地图
     void setMap(const Map& map, float mapping, float originx, float originy);
 
@@ -169,13 +223,14 @@ public:
     // 简单的梯形时间分配，得到比较稳定的解，建议speed大于40，acc影响没那么大，大于10就行
     [[nodiscard]] static std::vector<double> trapezoidalTimeAllocation(const std::vector<Eigen::Vector2f>& path, float maxSpeed, float maxAcc);
 protected:
-    int order = 6;// 阶数
-    int _maxdx  = 3;// 最大导数阶数
-    float dt = 0.1;// 时间间隔（秒）
-    SfcSquare sfc;// 安全飞行走廊生成器
-    float simplifyDPThs = 0.1f;// 单位：m
+    int order = 6;      // 阶数
+    int _maxdx  = 3;    // 最大导数阶数
+    float dt = 0.1;     // 时间间隔（秒）
+    SfcSquare sfc;      // 安全飞行走廊生成器
+    float simplifyDPThs = 0.1f; // 单位：m
     mutable std::mutex mapMutex;
-    double timeLimit = 1.; // 迭代求解的时间限制，单位秒
+    double timeLimit = 1.;      // 迭代求解的时间限制，单位秒
+    bool strictCollision = false; // 是否严格碰撞检测
 
     // 阶乘
     [[nodiscard]] static int factorial(int n);
@@ -198,56 +253,51 @@ protected:
     static std::pair<std::vector<Eigen::Vector2f>, std::vector<Eigen::Vector2f>> postProcess(const std::vector<PointPair> &corridor);
 
     // 带入方程
-    [[nodiscard]]std::vector<Eigen::Vector2f> evaluateEquation(const std::vector<double> &timeAllocated, const VecXd &resultx, const VecXd &result) const;
+    [[nodiscard]] std::vector<Eigen::Vector2f> evaluateEquation(const std::vector<double> &timeAllocated, const VecXd &resultx, const VecXd &result) const;
 
     // 带入方程求解线段
     [[nodiscard]] static std::vector<Eigen::Vector2f> lineDecoder(const std::vector<double>& timeAllocated, int index, const MatXd& solutionx, const MatXd& solutiony, bool normT);
 
+    // 闭式求解器(单轴)
+    [[deprecated]] MatXd closeSolver(const std::vector<double>& timeAllocated, const std::vector<float>& pathm) const;
+
     // 闭式求解器
-    [[nodiscard]] MatXd closeSolver(const std::vector<double>& timeAllocated, const std::vector<float>& pathm) const;
+    [[nodiscard]] std::pair<MatXd, MatXd> closeSolver(
+        const std::vector<double>& timeAllocated,
+        const std::vector<SolveInput::Item>& items,
+        bool normT
+    ) const;
 
     // 初始化x、y向量
     [[nodiscard]] std::pair<VecXd, VecXd> initXY(const std::vector<double> &timeAllocated, const std::vector<Eigen::Vector2f> &path) const;
 
-    // osqp求解一次
+    // OSQP求解一次：items保存控制点和速度，corridor为本轮的位置约束。
+    // 返回每段的x、y多项式系数，按幂次从高到低排列；失败返回空矩阵。
     std::pair<MatXd, MatXd> osqpExecute(
         const std::vector<double>& timeAllocated,
-        const std::vector<Eigen::Vector2f>& path,
+        const std::vector<SolveInput::Item>& items,
         const std::vector<std::array<float, 4>>& corridor,
-        float initVxMax,
-        float initVyMax,
-        float initVxMin,
-        float initVyMin,
         bool normT
     ) const;
 
-    // osqp求解后端
+    // OSQP迭代后端：发生碰撞时插入Item或收缩自动走廊，保留已有Item的约束。
     SolveOutput _solve(
         const std::vector<double>& timeAllocated,
-        const std::vector<Eigen::Vector2f>& path,
+        const std::vector<SolveInput::Item>& items,
         float maxCorridorRange,
         float corridorShrink,
         int maxIter,
-        float initVxMax,
-        float initVyMax,
-        float initVxMin,
-        float initVyMin,
         bool normT
     );
 
     // 闭式求解后端（无走廊）
     SolveOutput _solve(
         const std::vector<double>& timeAllocated,
-        const std::vector<Eigen::Vector2f>& path,
+        const std::vector<SolveInput::Item>& items,
         int maxIter,
-        float initVxMax,
-        float initVyMax,
-        float initVxMin,
-        float initVyMin,
         bool normT
     );
 };
 
 // TODO:
-// 1、闭式求解需要添加初始、结束速度约束。
-// 2、目前的osqp迭代并不是最终版本，每一步迭代的控制点应当更改为求解结果偏移出来的点，这样有助于相邻点求解。注意插值点必须在发过来的路线内。
+// OSQP迭代仍可进一步根据求解结果调整控制点；插值点必须保留在原始路线内。

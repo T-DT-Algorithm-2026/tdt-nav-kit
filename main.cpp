@@ -7,18 +7,32 @@
 #include <iostream>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/opencv.hpp>
+#include <tuple>
 #include <vector>
 
 int pass = 0;
 int fail = 0;
+static std::map<std::string, std::tuple<int, double, double>> record;
 
 template<typename Func>
 auto benchTime(const std::string& name, Func&& func) -> decltype(func()) {
     auto start = std::chrono::high_resolution_clock::now();
     auto result = std::forward<Func>(func)();
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    std::cout << name << " time: " << duration << " us" << std::endl;
+    auto duration = std::chrono::duration<double>(end - start).count();
+    std::cout << name << " time: " << duration * 1e6 << " us" << std::endl;
+    if(record.find(name) == record.end()){
+        record[name] = std::make_tuple(1, duration, duration);
+    }else{
+        int count = std::get<0>(record[name]);
+        double avg = std::get<1>(record[name]);
+        double max = std::get<2>(record[name]);
+        count++;
+        // 使用高精度算法
+        avg += (duration - avg) / static_cast<double>(count);
+        max = std::max(max, static_cast<double>(duration));
+        record[name] = std::make_tuple(count, avg, max);
+    }
     return result;
 }
 
@@ -27,8 +41,20 @@ void benchTimeVoid(const std::string& name, Func&& func) {
     auto start = std::chrono::high_resolution_clock::now();
     std::forward<Func>(func)();
     auto end = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    std::cout << name << " time: " << duration << " us" << std::endl;
+    auto duration = std::chrono::duration<double>(end - start).count();
+    std::cout << name << " time: " << duration * 1e6 << " us" << std::endl;
+    if(record.find(name) == record.end()){
+        record[name] = std::make_tuple(1, duration, duration);
+    }else{
+        int count = std::get<0>(record[name]);
+        double avg = std::get<1>(record[name]);
+        double max = std::get<2>(record[name]);
+        count++;
+        // 使用高精度算法
+        avg += (duration - avg) / static_cast<double>(count);
+        max = std::max(max, static_cast<double>(duration));
+        record[name] = std::make_tuple(count, avg, max);
+    }
 }
 
 YAstar::TMatrix<u_char> linearMask(int width, int height){
@@ -46,7 +72,7 @@ double test(Eigen::Vector2f start, Eigen::Vector2f end){
     std::cout<<"from ["<<start.x()<<", "<<start.y()<<"] to ["<<end.x()<<", "<<end.y()<<"]"<<std::endl;
     std::cout<<"// ["<<static_cast<int>(start.x() / 0.05f)<<", "<<static_cast<int>(start.y() / 0.05f)<<"]-["<<static_cast<int>(end.x() / 0.05f)<<", "<<static_cast<int>(end.y() / 0.05f)<<"] //"<<std::endl;
     std::cout<<"test({"<<start.x()<<", "<<start.y()<<"}, {"<<end.x()<<", "<<end.y()<<"});"<<std::endl;
-    cv::Mat map = cv::imread("../images/rmuc2025v2.png", cv::IMREAD_GRAYSCALE);
+    cv::Mat map = cv::imread("../images/rmuc2025.png", cv::IMREAD_GRAYSCALE);
     cv::Mat visualize = cv::Mat(map.rows, map.cols, CV_8UC3, cv::Scalar(255, 255, 255));
 
     // 图像高度用于Y轴翻转（图像坐标系从左上角开始，正常坐标系从左下角开始）
@@ -196,16 +222,181 @@ double test(Eigen::Vector2f start, Eigen::Vector2f end){
     return totalTime;
 }
 
+
+bool testSpeed(){
+    cv::Mat map = cv::imread("../images/rmuc2025.png", cv::IMREAD_GRAYSCALE);
+    if(map.empty()){
+        std::cout << "testSpeed: 地图读取失败" << std::endl;
+        return false;
+    }
+    using Item = MinimumSnap::SolveInput::Item;
+    const std::vector<Eigen::Vector2f> path{
+        {25.25f, 0.85f},
+        {24.85f, 5.15f}, // v:[-1.0, 1.5]
+        {18.25f, 4.25f},
+        {16.3f, 5.25f},
+        {16.25f, 5.25f},
+        {15.95f, 5.55f},
+        {15.15f, 9.8f}, // v:[0.5, 2.0]
+        {11.9f, 9.65f},
+        {9.75f, 10.75f},
+        {4.5f, 8.4f},
+        {3.5f, 6.1f},
+        {1.45f, 5.8f}
+    };
+    std::vector<Item> items(path.size());
+    for(size_t i = 0; i < path.size(); i++){
+        items[i].xy = path[i];
+    }
+
+    // 速度约束
+    const std::vector<size_t> speedIndex{1, 6};
+    items[1].vxvy = {-1.f, 1.5f};
+    items[1].useVxvy = true;
+    items[1].corridor = {path[1].x(), path[1].y(), path[1].x(), path[1].y()};
+    items[1].autoCorridor = false;
+    items[6].vxvy = {0.5f, 2.f};
+    items[6].useVxvy = true;
+    items[6].corridor = {path[6].x(), path[6].y(), path[6].x(), path[6].y()};
+    items[6].autoCorridor = false;
+
+    MinimumSnap minimumSnap;
+    minimumSnap.setOrder(6);
+    minimumSnap.setMaxDx(3);
+    minimumSnap.setMap(map, 0.05f, 0.f, 0.f);
+    minimumSnap.setTL(10.);
+
+    MinimumSnap::SolveInput input;
+    input.setItems(items);
+    input.setCollisionCheckIter(6);
+    input.setMaxCorridorRange(2.5f);
+    input.setCorridorShrink(0.f);
+    input.setNormTime(true);
+    auto times = MinimumSnap::trapezoidalTimeAllocation(path, 8.f, 2.f);
+    input.setTimeAllocated(times);
+
+    auto positionError = [&](const MinimumSnap::SolveOutput& result, size_t index){
+        double error = std::numeric_limits<double>::infinity();
+        for(const auto& point : result.path){
+            error = std::min(error, static_cast<double>((point - items[index].xy).norm()));
+        }
+        return error;
+    };
+
+    auto directionError = [&](const MinimumSnap::SolveOutput& result, size_t index){
+        size_t pointIndex = result.path.size();
+        for(size_t i = 0; i < result.path.size(); i++){
+            if((result.path[i] - items[index].xy).norm() < 1e-4f){
+                pointIndex = i;
+                break;
+            }
+        }
+        if(pointIndex == result.path.size() || pointIndex + 1 == result.path.size()){
+            return std::numeric_limits<double>::infinity();
+        }
+
+        Eigen::Vector2d tangent = (result.path[pointIndex + 1] - result.path[pointIndex]).cast<double>();
+        Eigen::Vector2d velocity = items[index].vxvy.cast<double>();
+        if(tangent.norm() == 0. || velocity.norm() == 0.){
+            return std::numeric_limits<double>::infinity();
+        }
+        double cosine = tangent.normalized().dot(velocity.normalized());
+        return std::acos(std::max(-1., std::min(1., cosine))) * 180. / std::acos(-1.);
+    };
+
+    bool passed = true;
+    for(auto backend : {MinimumSnap::Backend::Close, MinimumSnap::Backend::OSQPCorridor}){
+        input.setBackend(backend);
+        auto result = minimumSnap.solve(input);
+        int collisions = 0;
+        for(size_t i = 1; i < result.path.size(); i++){
+            if(minimumSnap.lineInObsticle(result.path[i - 1], result.path[i])){
+                collisions++;
+            }
+        }
+
+        double error = 0.;
+        for(size_t index : speedIndex){
+            error = std::max(error, positionError(result, index));
+        }
+        double angle = 0.;
+        for(size_t index : speedIndex){
+            angle = std::max(angle, directionError(result, index));
+        }
+
+        bool fixedCorridor = backend == MinimumSnap::Backend::Close;
+        if(backend == MinimumSnap::Backend::OSQPCorridor){
+            fixedCorridor = !result.corridor.empty();
+            for(size_t index : speedIndex){
+                bool found = false;
+                for(const auto& box : result.corridor){
+                    found = found || box == items[index].corridor;
+                }
+                fixedCorridor = fixedCorridor && found;
+            }
+        }
+        bool ok = !result.path.empty() && error < 1e-4 && std::isfinite(angle) && angle < 5. && fixedCorridor;
+        passed = passed && ok;
+        std::string backendName = backend == MinimumSnap::Backend::Close ? "Close" : "OSQPCorridor";
+        std::cout<<"testSpeed backend="<< backendName
+            <<" solveSuccess="<<result.success<<" iter="<<result.iter
+            <<" 位置误差="<<error
+            <<" 方向误差="<<angle<<" 碰撞线段="<<collisions
+            <<" 约束检查="<<(ok ? "通过" : "失败")<<
+        std::endl;
+
+        cv::Mat image;
+        cv::cvtColor(map, image, cv::COLOR_GRAY2BGR);
+        auto drawCorridor = result.corridor;
+        if(drawCorridor.empty()){
+            drawCorridor = minimumSnap.getSfc().getCorridor(path, 2.5f, 0.f).corridor;
+        }
+        if(!drawCorridor.empty()){
+            auto rects = SfcSquare::pointPair2Rects(drawCorridor);
+            for(size_t i = 0; i < rects.size(); i++){
+                auto rect = rects[i];
+                rect.x *= 20.f;
+                rect.y *= 20.f;
+                rect.width *= 20.f;
+                rect.height *= 20.f;
+                cv::rectangle(image, rect, cv::Scalar(255, 0, 0), 1);
+            }
+        }
+        std::vector<cv::Point> front, curve;
+        for(const auto& p : path){
+            front.emplace_back(p.x() * 20, p.y() * 20);
+        }
+        for(const auto& p : result.path){
+            curve.emplace_back(p.x() * 20, p.y() * 20);
+        }
+        cv::polylines(image, front, false, cv::Scalar(0, 128, 0));
+        if(!curve.empty()){
+            cv::polylines(image, curve, false, cv::Scalar(0, 0, 192));
+        }
+        for(size_t index : speedIndex){
+            Eigen::Vector2f direction = items[index].vxvy.normalized();
+            Eigen::Vector2f tip = items[index].xy + direction;
+            cv::arrowedLine(image, cv::Point(items[index].xy.x() * 20, items[index].xy.y() * 20),
+                cv::Point(tip.x() * 20, tip.y() * 20), cv::Scalar(0, 160, 160), 1, cv::LINE_AA, 0, 0.35);
+        }
+        cv::resize(image, image, cv::Size(image.cols * 3, image.rows * 3));
+        cv::imshow("path", image);
+        cv::waitKey(0);
+    }
+    return passed;
+}
+
 #include <random>
 
 int main(){
+    testSpeed();
     test({25.2695, 14.14615}, {1.47266, 9.1749});
     test({2.5323, 1.88688}, {25.5733, 13.5454});
     test({21.5323, 4.88688}, {4.1733, 14.1454});
     test({4.0, 8.0}, {7.0, 0.95});
     test({19.2695, 8.54615}, {1.47266, 9.1749});
     test({4.29, 13.05}, {23.7, 0.95});
-    cv::Mat map = cv::imread("../images/rmuc2025v2.png", cv::IMREAD_GRAYSCALE);
+    cv::Mat map = cv::imread("../images/rmuc2025.png", cv::IMREAD_GRAYSCALE);
     std::mt19937 gen(time(0));
     std::uniform_real_distribution<float> randx(0, 28);
     std::uniform_real_distribution<float> randy(0, 15);
@@ -232,5 +423,11 @@ int main(){
     }
     float rate = static_cast<float>(pass) / (pass + fail) * 100;
     std::cout << "\033[32mCheck Pass  accuracy: " << pass << "/" << pass + fail << "  rate: " << rate << "%\033[0m" << std::endl;
+    for(const auto& r : record){
+        std::string name = r.first;
+        double avg = std::get<1>(r.second);
+        double max = std::get<2>(r.second);
+        std::cout << "Function: " << name << " | Average: " << avg * 1e6 << " us | Max: " << max * 1e6 << " us" << std::endl;
+    }
     return 0;
 }
