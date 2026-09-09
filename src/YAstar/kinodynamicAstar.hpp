@@ -1,6 +1,7 @@
 /***************
  * @file kinodynamicAstar.hpp
  * @brief 带速度、加速度约束的A星算法，地图接口复用YAstar。
+ * @author Nathongc
  ***************/
 
 #pragma once

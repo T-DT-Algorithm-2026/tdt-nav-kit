@@ -6,6 +6,7 @@
 #include <ranges>
 #include <span>
 #include <utility>
+#include <vector>
 
 ////////////////////////////// Mask ///////////////////////////////
 
@@ -82,8 +83,21 @@ bool Mask::pushMask(const TMatrix<u_char>& maskMap,  const std::string& name, u_
         // create new layer, already allocated
         int laSize = sizeof(unsigned long long int) * 8 * mask.shape[2];
         if (size() >= laSize) {
-            std::cout << "警告：当前仅支持" << laSize << "个以内的掩码，请预分配更多的层数！跳过" << std::endl;
-            return false; // 不支持多于64个mask
+            if(this->autoExtend){
+                auto extended = std::vector<unsigned long long int>(mask.shape[0] * mask.shape[1] * (mask.shape[2] + 1), 0);
+                // 复制原来的数据
+                for(int a  = 0; a < mask.shape[0] * mask.shape[1]; a++){
+                    int src = a * mask.shape[2];
+                    int dst = a * (mask.shape[2] + 1);
+                    std::copy(mask.data.begin() + src, mask.data.begin() + src + mask.shape[2], extended.begin() + dst);
+                }
+                std::swap(mask.data, extended);
+                laSize+=64;
+                mask.shape[2]++;
+            } else{
+                std::cout << "警告：当前仅支持" << laSize << "个以内的掩码，请预分配更多的层数！跳过" << std::endl;
+                return false; // 不支持多于64*nlayers个mask
+            }
         }
         curlayer = static_cast<int>(size());
         layerNames.push_back(name);

@@ -2,6 +2,9 @@
 
 这是一个面向二维栅格地图的算法组件，组件提供前端路径搜索、动力学搜索和后端轨迹优化等基础模块，可以根据实际工程需要选择其中的一部分接入。
 
+## 效果展示
+
+
 ## 组件内容
 
 - `YAstar`：前端算法，包括普通Astar和Kinodynamic Astar两种搜索算法，支持二维栅格地图的路径规划。
@@ -53,10 +56,19 @@ make -j4
 ./play
 ```
 
-## 算法学习文档
+运行结果：
+![](./images/example.png)
+
+其中：
+- 绿色折线为前端搜索后化简的路径。
+- 蓝色框为后端优化最终使用的走廊。
+- 红色曲线为后端优化的最终轨迹。
+
+## 文档
 
 - [`doc/Astar.md`](doc/Astar.md)：Astar 和 Kinodynamic Astar 的原理与规划思路。
 - [`doc/MinimumSnap.md`](doc/MinimumSnap.md)：Minimum Snap 的数学建模、求解和碰撞处理。
+- [`doc/Usage.md`](doc/Usage.md)：使用文档。
 
 ## 联系作者
 1. SnifferCaptain
@@ -79,22 +91,4 @@ Eigen3 和 OpenCV 是外部依赖，许可证请以各自安装版本附带的�
 
 ## License
 
-Copyright (c) 2026 SnifferCaptain and Nathongc
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+使用 [MIT](LICENSE) 许可证，SnifferCaptain and Nathongc

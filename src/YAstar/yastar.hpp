@@ -31,6 +31,7 @@ struct Mask{
     MaskMap mask;                               // [height, width]，!=0表示障碍物
     std::vector<std::string> layerNames;        // 存储层次的名称
     std::vector<TimePoint> layerTimes;          // 存储层次的更新时间
+    bool autoExtend = true;                     // 是否自动扩展掩码层数
 
     Mask();
     void setShape(int width, int height, int num_layers = 1);        // 设置mask的形状，自动reset
@@ -45,9 +46,6 @@ struct Mask{
     // @param name 掩码的名称
     // @param maskValue 掩码地图中对应值为maskValue的位置会被置为障碍物
     bool pushMask(const TMatrix<u_char> &maskmap, const std::string& name = "", u_char maskValue = 0);
-
-    // TODO:
-    // masked = hwn | n --> hw
 };
 
 // @brief 基于A*修改的雷达重投影类
