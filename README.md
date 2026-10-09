@@ -46,6 +46,27 @@ https://github.com/user-attachments/assets/041856f4-c33e-4f42-a5ac-2c3a060bfb0f
 
 脚本会将 OSQP 和 OsqpEigen 构建并安装到 `3rd/install`。OpenCV只用于 `main.cpp` 示例中的图片读取和可视化，不属于算法组件的核心依赖，需要运行示例时再自行安装。
 
+如果需要安装在环境内，可以选择以下命令行：
+```bash
+# 安装osqp
+git clone --recursive -b v1.0.0 https://github.com/osqp/osqp
+cd osqp
+mkdir build
+cd build
+cmake .. -DBUILD_SHARED_LIBS=ON
+make -j8
+sudo make install
+
+# osqp-eigen安装
+git clone -b v0.11.0 https://github.com/robotology/osqp-eigen.git
+cd osqp-eigen
+mkdir build 
+cd build
+cmake ..    # 默认安装在/usr/local/include中,非apt安装的包，不在/usr/include/下，而是/usr/local/include下
+make -j8
+sudo make install
+```
+
 ## 使用示例
 
 `main.cpp`只是一个使用示例，实际工程可以根据需要引入 `src` 中的组件源码。
